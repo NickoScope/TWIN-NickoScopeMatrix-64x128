@@ -1,5 +1,6 @@
 //! The `hub75-panel` board's inputs through a whole machine: script verbs, the board's deadline
-//! bounding the device tick, the edges reaching the GPIO model and latching its edge interrupt.
+//! bounding the device tick (each edge reaches the GPIO model on the cycle it was scheduled for,
+//! `SocBus::board_edge_lag`), the edges latching the GPIO edge interrupt.
 use esp32s3::board::panel_inputs::{remote_code, NEC_MESSAGE_US, PIN_ENC_A, PIN_ENC_B, PIN_GPIO0};
 use esp_soc::{ScriptAction, SocBus, Stop};
 
@@ -62,7 +63,12 @@ fn a_remote_press_reaches_gpio0_on_its_cycles_and_latches_the_change_interrupt()
     assert_eq!(g0.len(), 68 + 2, "a data message, then the switch press");
     let start = g0[0].0;
     assert!((240_001..=240_001 + 64 * 4).contains(&start), "first edge {start} just after the script time");
-    // The NEC message's runs, exact to the cycle, as the board scheduled them.
+    // Each edge reached the GPIO model on the cycle the board scheduled it for: the board's
+    // deadline bounds the device tick. Without that bound the edges arrive up to a tick backstop
+    // late and batched (review 4 measured 32,639 cycles), which IRrecv's ISR would timestamp.
+    assert_eq!(m.bus.board_edge_lag, 0, "a board edge reached GPIO_IN after its cycle");
+    // The NEC message's runs, exact to the cycle, as the board scheduled them (and, by the lag
+    // above, as the GPIO model saw them).
     let widths: Vec<u64> = g0[..68].windows(2).map(|w| (w[1].0 - w[0].0) / US).collect();
     assert_eq!(&widths[..3], [8960, 4480, 560]);
     let mut code = 0u32;

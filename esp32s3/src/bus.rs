@@ -62,8 +62,15 @@ pub struct SocBus {
     spi2_scheduled: Option<(u64, Spi2DmaCompletion)>,
     /// set by any peripheral write: interrupt lines must be re-evaluated before the next instruction
     pub irq_dirty: bool,
-    /// GPIO edges for observers, while one wants them: (cycle, pin, level)
+    /// GPIO edges for observers, while one wants them: (cycle, pin, level). A board edge carries
+    /// the cycle the board scheduled it for; `board_edge_lag` says how late the GPIO model saw it.
     pub gpio_events: Option<Vec<(u64, u8, bool)>>,
+    /// The most cycles any board edge reached the GPIO model after the cycle it was scheduled for;
+    /// a firmware that timestamps edges in its ISR (IRrecv's `micros()`) sees this lateness. Zero
+    /// for edges that come while the cores sleep, since the board's deadline bounds the device tick
+    /// (`refresh_tick_budget`) and the idle skip; while a core runs, device time moves at the end
+    /// of its round, so an edge due inside one lands up to a quantum late.
+    pub board_edge_lag: u64,
     pub debug: esp_soc::DebugFlags,
     /// Software TLB: the last resolved mapping per 64 KiB page, so loads, stores and fetches skip
     /// the address-range walk and the flash MMU. Cleared whenever the MMU changes.
@@ -157,7 +164,7 @@ impl SocBus {
         let bus_uninit = SocBus {
             sram: vec![0; SRAM_SIZE], irom: vec![0; (IROM_MASK_HIGH - IROM_MASK_LOW) as usize], drom: vec![0; (DROM_MASK_HIGH - DROM_MASK_LOW) as usize],
             rtc_fast: vec![0; 8192], rtc_slow: vec![0; 8192], flash: vec![0xff; flash_size], psram: vec![0; psram_size],
-            mmu: [MMU_INVALID; MMU_ENTRIES], flash_file: None, periph: Peripherals::new(mac), board: Box::new(crate::board::Atech14::new()), cycles: 0, last_fault: None, spi2_dma_fault: None, irq_dirty: false, gpio_events: None, debug: Default::default(),
+            mmu: [MMU_INVALID; MMU_ENTRIES], flash_file: None, periph: Peripherals::new(mac), board: Box::new(crate::board::Atech14::new()), cycles: 0, last_fault: None, spi2_dma_fault: None, irq_dirty: false, gpio_events: None, board_edge_lag: 0, debug: Default::default(),
             spi2_timing: false, spi2_scheduled: None,
             tlb: vec![TlbEntry::EMPTY; TLB_SIZE], page_ver: Vec::new(), ver_base: [0; 7], flash_epoch: BUS_EPOCHS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) << 32, code_blk: Vec::new(), tick_pending: 0, tick_budget: 0, defer_mmio: false, mmio_deferred: false, vq_violations: 0,
             approximate_cache: None, approximate_cache_pending: 0, approximate_cache_fast_internal: false, approximate_cache_inline: false,
@@ -830,6 +837,7 @@ impl SocBus {
         self.board.advance_to(self.cycles);
         for edge in self.board.take_edges() {
             if let Some(events) = &mut self.gpio_events { events.push((edge.cycle, edge.pin, edge.level)); }
+            self.board_edge_lag = self.board_edge_lag.max(self.cycles.saturating_sub(edge.cycle));
             let old_input = self.periph.gpio.input;
             self.periph.gpio.set_input(edge.pin, edge.level);
             // set_input reports latched edges only. Level IRQs can rise or fall
