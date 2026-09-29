@@ -133,6 +133,11 @@ impl esp_soc::SocBus for SocBus {
         p.rtc.ram.write(0x38, cause | (cause << 6));
         p.rtc.ram.write(0x98, 0);                       // watchdog disarmed by the reset; the ROM re-arms it
         p.i2s0.pcm = old.i2s0.pcm; p.i2s0.frames_out = old.i2s0.frames_out; p.i2s1.pcm = old.i2s1.pcm; p.i2s1.frames_out = old.i2s1.frames_out;   // keep the captured audio continuous
+        // The virtual AP and the network behind it are the world outside the chip: a reset leaves
+        // them there. The AP forgets the station (it must associate again), the network keeps its
+        // NAT flows, forwarded host ports and lease, as a router would for a rebooting client.
+        p.wifi.ap = old.wifi.ap.map(|a| { let stats = a.stats; let mut n = crate::wifi::VirtualAp::new(a.cfg, a.log); n.stats = stats; n });
+        p.wifi.net = old.wifi.net;
         self.mmu = [MMU_INVALID; MMU_ENTRIES];
         self.invalidate_tlb();
         self.reset_approximate_cache();

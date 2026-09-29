@@ -58,6 +58,8 @@
   .knob::after { content: ""; position: absolute; left: 50%; top: 10px; width: 4px; height: 18px; margin-left: -2px; border-radius: 2px; background: var(--amber); transform-origin: 2px 38px; transform: rotate(var(--a, 0deg)); }
   .knob.down { box-shadow: 0 2px 6px rgba(0,0,0,.6), inset 0 0 0 6px #3a3f46; }
   .hint { font-size: 11px; color: var(--muted); margin-top: 8px; }
+  .board-keys { display: flex; gap: 8px; margin-top: 10px; }
+  .board-keys button { flex: 1; font: 11px var(--mono); letter-spacing: .08em; border-radius: 6px; }
   pre#console { margin: 0; height: 220px; overflow: auto; font: 11px/1.4 var(--mono); color: #cfd3d8; background: #0a0b0c; border-radius: 6px; padding: 8px; white-space: pre-wrap; word-break: break-word; }
   form.line { display: flex; gap: 6px; margin-top: 8px; }
   form.line input { flex: 1; min-width: 0; font: 12px var(--mono); color: var(--ink); background: #0a0b0c; border: 1px solid var(--rule); border-radius: 6px; padding: 7px 8px; }
@@ -103,6 +105,10 @@
         <button id="cw" type="button" aria-label="Turn right">⟳</button>
       </div>
       <p class="hint">Scroll or drag to turn a detent at a time; click to press, hold for a long press.</p>
+      <div class="board-keys">
+        <button id="boot" type="button" title="GPIO0 low while held, as the board's BOOT key">BOOT</button>
+        <button id="rst" type="button" title="The board's RESET key: the chip restarts, the flash keeps everything">RESET</button>
+      </div>
     </section>
     <section class="card">
       <h2>Console · USB</h2>
@@ -235,8 +241,9 @@
     el.innerHTML = `${b.label}<small>${b.n}</small>`; el.title = `button ${b.n}, NEC 0x${b.code.toString(16).toUpperCase()}`;
     if (b.n === 10) el.style.gridColumn = '2';
     let t0 = 0;
-    const down = (e) => { e.preventDefault(); t0 = performance.now(); el.classList.add('held'); $('irled').classList.add('tx'); send({ t: 'ir', code: '0x' + b.code.toString(16), down: '1' }); };
-    const up = () => { if (!t0) return; t0 = 0; el.classList.remove('held'); $('irled').classList.remove('tx'); send({ t: 'ir', code: '0x' + b.code.toString(16), down: '0' }); };
+    // `ir down <code>` starts the NEC message and its repeats; `ir up` stops them (panel_inputs.rs)
+    const down = (e) => { e.preventDefault(); t0 = performance.now(); el.classList.add('held'); $('irled').classList.add('tx'); send({ t: 'input', line: 'ir down 0x' + b.code.toString(16) }); };
+    const up = () => { if (!t0) return; t0 = 0; el.classList.remove('held'); $('irled').classList.remove('tx'); send({ t: 'input', line: 'ir up' }); };
     el.addEventListener('pointerdown', down); el.addEventListener('pointerup', up); el.addEventListener('pointerleave', up); el.addEventListener('pointercancel', up);
     remote.appendChild(el);
   }
@@ -252,6 +259,11 @@
   knob.addEventListener('pointermove', (e) => { if (dragY === null) return; const dy = e.clientY - dragY; if (Math.abs(dy) >= 24) { if (!moved) { moved = true; send({ t: 'knobpress', v: '0' }); knob.classList.remove('down'); } turn(dy > 0 ? 1 : -1); dragY = e.clientY; } });
   const release = () => { if (dragY === null) return; dragY = null; knob.classList.remove('down'); if (!moved) send({ t: 'knobpress', v: '0' }); };
   knob.addEventListener('pointerup', release); knob.addEventListener('pointercancel', release);
+  const boot = $('boot');
+  boot.addEventListener('pointerdown', (e) => { e.preventDefault(); boot.classList.add('held'); send({ t: 'input', line: 'boot down' }); });
+  const bootUp = () => { if (!boot.classList.contains('held')) return; boot.classList.remove('held'); send({ t: 'input', line: 'boot up' }); };
+  boot.addEventListener('pointerup', bootUp); boot.addEventListener('pointerleave', bootUp);
+  $('rst').addEventListener('click', () => send({ t: 'reset' }));
   knob.addEventListener('keydown', (e) => { if (e.key === 'ArrowLeft') turn(-1); else if (e.key === 'ArrowRight') turn(1); else if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); send({ t: 'knobpress', v: '1' }); setTimeout(() => send({ t: 'knobpress', v: '0' }), 120); } });
 })();
 </script>

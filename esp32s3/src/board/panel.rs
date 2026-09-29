@@ -98,7 +98,8 @@ impl BoardModel for Panel {
     fn check_input(&self, cmd: &str, args: &str) -> Option<Result<(), String>> { self.inputs.check_input(cmd, args) }
     fn input_at(&mut self, cycle: VirtualCycle, cmd: &str, args: &str) -> Result<(), String> { self.inputs.input_at(cycle, cmd, args) }
     fn report(&self) -> String {
-        self.inputs.report() + &format!("[panel] HUB75: {} bus words at {:.2} MHz PCLK, {} refreshes ({:.1} Hz), {} light windows\n",
+        let mut r = self.inputs.report(); if !r.is_empty() && !r.ends_with('\n') { r.push('\n'); }
+        r + &format!("[panel] HUB75: {} bus words at {:.2} MHz PCLK, {} refreshes ({:.1} Hz), {} light windows\n",
                 self.words, self.pclk as f64 / 1e6, self.refreshes, if self.words > 0 { self.refreshes as f64 * self.pclk as f64 / self.words as f64 } else { 0.0 }, self.frames)
     }
 }
