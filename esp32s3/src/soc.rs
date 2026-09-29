@@ -91,6 +91,7 @@ impl esp_soc::SocBus for SocBus {
         let img = esp_soc::image::parse(image)?;
         self.periph.system.preset_after_bootloader();
         self.periph.rtc.preset_after_bootloader();
+        self.periph.timg[0].preset_after_bootloader();
         for s in &img.segments {
             let start = app_off + s.file_off as usize;
             let end = start + s.len as usize;
@@ -127,6 +128,7 @@ impl esp_soc::SocBus for SocBus {
         let p = &mut self.periph;
         p.efuse = old.efuse;
         p.misc.log_unknown = old.misc.log_unknown; p.spi1.log = old.spi1.log;
+        for (n, o) in p.timg.iter_mut().zip(&old.timg) { if let (Some(n), Some(o)) = (&mut n.wdt, &o.wdt) { n.log = o.log; } }
         p.spi0.jedec = old.spi0.jedec; p.spi1.jedec = old.spi1.jedec;   // the flash chip is not reset: its ID keeps the --flash-mb capacity
         p.spi0.psram_mr[2] = old.spi0.psram_mr[2]; p.spi1.psram_mr[2] = old.spi1.psram_mr[2];   // nor the PSRAM: MR2 is read-only (APS12808L-OBMx Rev 3.0a §7.7) and keeps the --psram-mb density
         p.rtc.ram = old.rtc.ram; p.rtc.slow_ticks = old.rtc.slow_ticks;
@@ -186,6 +188,7 @@ impl esp_soc::SocBus for SocBus {
         self.irq_dirty = true;
         cause
     }
+    fn rom_boot(&mut self) { self.periph.rom_boot = true; }
     fn sw_reset(&self) -> bool { self.periph.rtc.sw_reset }
     fn request_reset(&mut self, cause: u32) { self.periph.rtc.sw_reset = true; self.periph.rtc.reset_cause = cause; }
     fn reset_cause(&self) -> u32 { self.periph.rtc.reset_cause }

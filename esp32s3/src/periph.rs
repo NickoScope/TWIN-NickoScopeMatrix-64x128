@@ -42,6 +42,10 @@ pub const NUM_SOURCES: usize = 99;
 
 pub const CPU_HZ: u64 = 240_000_000;
 
+/// The strap latch (GPIO_STRAP_REG) selects a boot from SPI flash: ETS_IS_FLASH_BOOT(), IDF 4.4.7
+/// soc/esp32s3/include/soc/boot_mode.h:20, 38, 57 (IS_1XXX || IS_0100).
+pub fn flash_boot(strap: u32) -> bool { strap & 0x08 == 0x08 || strap & 0x0f == 0x04 }
+
 // ------------------------------------------------------------------ Interrupt matrix
 /// `status` is the live source state, refreshed by `Peripherals::pre_access` before a read.
 pub struct IntMatrix { pub map: [[u32; NUM_SOURCES]; 2], ram: RegRam, pub status: [u32; 4] }
@@ -522,6 +526,9 @@ pub struct Peripherals {
     pub spi_exec: bool,       // SPI1 command pending execution against the flash array
     last_status: [u32; 4],
     pub intmatrix_dirty: bool,
+    /// The chip is on its way out of reset through the ROM (`SocBus::rom_boot`): flash boot
+    /// protection may run. Code the emulator places and enters itself never boots.
+    pub rom_boot: bool,
 }
 
 // Every peripheral, where it sits, and its interrupt source numbers. Entries for one block are
@@ -532,8 +539,8 @@ device_set! { Peripherals; clock: (clock) CPU_HZ, [(ClockDomain::Systimer, 15), 
     0x2e "UART2" (uart[2]) => [];
     0x38 "USB_SERIAL_JTAG" (usb) => [SRC_USB_SERIAL_JTAG];
     0x23 "SYSTIMER" (systimer) => [SRC_SYSTIMER_T0, SRC_SYSTIMER_T1, SRC_SYSTIMER_T2];
-    0x1f "TIMG0" (timg[0]) => [SRC_TG0_T0, SRC_TG0_T1];
-    0x20 "TIMG1" (timg[1]) => [SRC_TG1_T0, SRC_TG1_T1];
+    0x1f "TIMG0" (timg[0]) => [SRC_TG0_T0, SRC_TG0_T1, SRC_TG0_WDT];
+    0x20 "TIMG1" (timg[1]) => [SRC_TG1_T0, SRC_TG1_T1, SRC_TG1_WDT];
     0xc2 "INTERRUPT" (intmatrix) => [];
     0x04 "GPIO" (gpio) => [SRC_GPIO];
     0x08 "RTC" (rtc) => [];
@@ -591,13 +598,13 @@ impl Peripherals {
     pub fn new(mac: [u8; 6]) -> Self {
         Peripherals {
             usb: UsbSerialJtag::new(CPU_HZ), uart: [Uart::new(UartLayout::S3), Uart::new(UartLayout::S3), Uart::new(UartLayout::S3)], systimer: Systimer::new(),
-            timg: [TimerGroup::new(), TimerGroup::new()], intmatrix: IntMatrix::new(), gpio: Gpio::new(), rtc: RtcCntl::new(),
+            timg: [TimerGroup::new_s3(0), TimerGroup::new_s3(1)], intmatrix: IntMatrix::new(), gpio: Gpio::new(), rtc: RtcCntl::new(),
             efuse: Efuse::new(mac), system: SystemRegs::new(0x30), extmem: Extmem::new(), spi0: SpiMem::new(false), spi1: SpiMem::new(true),
             i2c: [crate::i2c::I2c::new(), crate::i2c::I2c::new()], lcd_cam: LcdCam::new(), sdmmc: Sdmmc::new(), spi2: GpSpi::new(), pcnt: Pcnt::new(), wifi: WifiMac::new(), fe: FeIq { word: 0, done: false },
             aes: Aes::new(), rsa: Rsa::new(), sha: Sha::new(), wdev: Wdev::new(), i2c_mst: I2cMst::new(), gdma: Gdma::new(), i2s0: I2s::new(CPU_HZ), i2s1: I2s::new(CPU_HZ), rmt: Rmt::new(CPU_HZ),
             io_mux: RegRam::new(), misc: Misc::new(), fake_reads: std::env::var("ESP_EMU_FAKE_READ").ok().map(|v| v.split(',').filter_map(|e| { let mut p = e.split(':'); let a = u32::from_str_radix(p.next()?.trim_start_matches("0x"), 16).ok()?; let o = u32::from_str_radix(p.next().unwrap_or("0").trim_start_matches("0x"), 16).ok()?; let m = u32::from_str_radix(p.next().unwrap_or("ffffffff").trim_start_matches("0x"), 16).ok()?; Some((a, (o, m))) }).collect()).unwrap_or_default(),
             clock: Self::new_clock(),
-            spi_exec: false, last_status: [0; 4], intmatrix_dirty: false,
+            spi_exec: false, last_status: [0; 4], intmatrix_dirty: false, rom_boot: false,
         }
     }
 
@@ -662,7 +669,17 @@ impl Peripherals {
     /// Advance device time by `cycles` CPU cycles (every clocked device gets its own clock's
     /// ticks), then route GPIO input edges to the pulse counters.
     pub fn tick(&mut self, cycles: u64) -> bool {
+        // Flash boot protection runs TIMG0's MWDT "during flash booting process" (TRM v1.8
+        // §13.2.2.4): only a start from the ROM's reset vector boots, and the strap latch says
+        // whether from flash, as ETS_IS_FLASH_BOOT() reads it (IDF 4.4.7
+        // soc/esp32s3/include/soc/boot_mode.h:57, IS_1XXX || IS_0100). Read here, not at the
+        // reset: `--strap` is set after it. Whether silicon gates it on the strap or the ROM stops
+        // it in download mode is not documented; the ROM holds no write to TIMG0's WDTCONFIG0 but
+        // the unused disable_default_watchdog (0x40043714).
+        self.timg[0].set_flash_boot(self.rom_boot && flash_boot(self.gpio.strap));
         let mut irq_changed = Dispatch::tick(self, cycles);
+        // A watchdog stage that resets the chip goes through the reset path the RTC watchdog uses.
+        for g in &mut self.timg { if let Some(cause) = g.take_reset() { self.rtc.request_reset(cause); } }
         if !self.gpio.input_changes.is_empty() {
             let before = self.pcnt.irq();
             let changes = std::mem::take(&mut self.gpio.input_changes);

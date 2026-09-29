@@ -55,3 +55,69 @@ fn timg_steps_after_an_alarm_survive_a_long_round() {
         }
     }
 }
+
+/// The MWDTs' interrupt: TIMG_WDT_INT (bit 2 of each group's INT registers) is source 52 for
+/// TIMG0 and 55 for TIMG1 (ETS_TG0/TG1_WDT_LEVEL_INTR_SOURCE, IDF 4.4.7
+/// soc/esp32s3/include/soc/periph_defs.h:108, 111), the one the Interrupt WDT maps to CPU int 24.
+#[test]
+fn both_watchdog_interrupts_reach_the_s3_interrupt_matrix() {
+    use esp32s3::periph::{SRC_TG0_WDT, SRC_TG1_WDT};
+    let mut peripherals = Peripherals::new([0; 6]);
+    for (base, source) in [(0x6001_f000, SRC_TG0_WDT), (0x6002_0000, SRC_TG1_WDT)] {
+        peripherals.write32(base + 0x4c, 1 << 16);                // prescale 1
+        peripherals.write32(base + 0x50, 10);                     // stage 0: 10 APB ticks
+        peripherals.write32(base + 0x48, (1 << 31) | (1 << 29));  // enabled, stage 0 interrupts
+        peripherals.write32(base + 0x70, 1 << 2);
+        peripherals.tick(27);                                     // 9 APB ticks
+        let bit = 1 << (source % 32);
+        assert_eq!(peripherals.source_status()[source / 32] & bit, 0);
+        peripherals.tick(3);
+        assert_ne!(peripherals.source_status()[source / 32] & bit, 0);
+        assert_ne!(peripherals.read32(0x600c_2190) & bit, 0, "CORE0_INTR_STATUS_REG_1");
+        peripherals.write32(base + 0x7c, 1 << 2);
+        assert_eq!(peripherals.source_status()[source / 32] & bit, 0);
+        peripherals.write32(base + 0x48, 0);
+    }
+}
+
+/// A stage that resets goes through RTC_CNTL's reset request, with the group's cause
+/// (TG0WDT_SYS_RESET 7, TG1WDT_SYS_RESET 8: IDF 4.4.7 esp_rom/include/esp32s3/rom/rtc.h:76-77).
+#[test]
+fn a_watchdog_reset_takes_the_chip_reset_path() {
+    for (base, cause) in [(0x6001_f000, esp_periph::RST_TG0WDT_SYS), (0x6002_0000, esp_periph::RST_TG1WDT_SYS)] {
+        let mut peripherals = Peripherals::new([0; 6]);
+        peripherals.write32(base + 0x50, 100);
+        peripherals.write32(base + 0x48, (1 << 31) | (3 << 29));  // stage 0 resets the system
+        peripherals.tick(297);
+        assert!(!peripherals.rtc.sw_reset);
+        peripherals.tick(3);
+        assert!(peripherals.rtc.sw_reset);
+        assert_eq!(peripherals.rtc.reset_cause, cause);
+    }
+}
+
+/// Flash boot protection: in a boot through the ROM with the strap latch on SPI boot, TIMG0's
+/// MWDT resets the core once STG0_HOLD's reset value, 26,000,000 cycles of the undivided 80 MHz
+/// APB, has passed, unless the bootloader clears TIMG_WDT_FLASHBOOT_MOD_EN; in download mode, or
+/// for code the emulator enters itself (no boot), it stays still.
+#[test]
+fn flash_boot_protection_follows_the_strap() {
+    const HOLD0_CPU_CYCLES: u64 = 26_000_000 * 3;
+    for (rom_boot, strap, resets) in [(true, 0x0f, true), (true, 0x08, true), (true, 0x04, true), (true, 0x03, false), (true, 0x00, false), (false, 0x0f, false)] {
+        let mut peripherals = Peripherals::new([0; 6]);
+        peripherals.rom_boot = rom_boot;
+        peripherals.gpio.strap = strap;
+        peripherals.tick(HOLD0_CPU_CYCLES - 3);
+        assert!(!peripherals.rtc.sw_reset, "strap {strap:#x}");
+        peripherals.tick(3);
+        assert_eq!(peripherals.rtc.sw_reset, resets, "rom boot {rom_boot}, strap {strap:#x}");
+        if resets { assert_eq!(peripherals.rtc.reset_cause, esp_periph::RST_TG0WDT_SYS); }
+    }
+    let mut peripherals = Peripherals::new([0; 6]);
+    peripherals.rom_boot = true;
+    peripherals.tick(HOLD0_CPU_CYCLES / 2);
+    let config0 = peripherals.read32(0x6001_f048);
+    peripherals.write32(0x6001_f048, config0 & !(1 << 14));
+    peripherals.tick(10 * HOLD0_CPU_CYCLES);
+    assert!(!peripherals.rtc.sw_reset, "cleared by bootloader_config_wdt()");
+}
