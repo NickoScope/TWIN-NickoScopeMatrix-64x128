@@ -147,6 +147,7 @@ impl esp_soc::SocBus for SocBus {
         if self.periph.spi2.transfers > 0 { r.push(format!("[emu] spi2: {} transfers", self.periph.spi2.transfers)); }
         if self.periph.rmt.rmt.tx_count > 0 { r.push(format!("[emu] rmt: {} transmissions", self.periph.rmt.rmt.tx_count)); }
         if self.periph.radio.scans > 0 { r.push(format!("[emu] 802.15.4: {} energy scans, last channel {} = {} dBm", self.periph.radio.scans, self.periph.radio.channel(), self.periph.radio.ed_rss)); }
+        if let Some(b) = self.periph.wifi_mac.net.as_ref().and_then(|n| n.bridge_report()) { r.push(b); }
         let b = self.board.report(); if !b.is_empty() { r.push(b); }
         r.join("\n")
     }

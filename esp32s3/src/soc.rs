@@ -186,8 +186,9 @@ impl esp_soc::SocBus for SocBus {
         let mut s = format!("[emu] i2s frames out: {} (i2s0 @ {} Hz) {} (i2s1 @ {} Hz)\n", p.i2s0.frames_out, p.i2s0.sample_rate, p.i2s1.frames_out, p.i2s1.sample_rate);
         { let r = self.board.report(); if !r.is_empty() { s += &r; s += "\n"; } }
         { let w = &p.wifi;
-          if w.tx_frames + w.rx_frames > 0 { s += &format!("[emu] wifi: {} frames sent by the station, {} received ({} dropped: no descriptor){}\n", w.tx_frames, w.rx_frames, w.rx_dropped, w.ap.as_ref().map_or(String::new(), |ap| format!("; AP: {} beacons, {} probe responses, {} data frames from the station, state {:?}", ap.stats.0, ap.stats.1, ap.stats.2, ap.state))); }
-          if let Some(n) = &w.net { s += &format!("[emu] net: {} DHCP leases, {} ARP replies, {} DNS answers, {} NTP answers, {} TCP refused, {} pings, {} frames ignored\n", n.dhcp_acks, n.arp_replies, n.dns_answers, n.ntp_answers, n.tcp_rejects, n.pings, n.unhandled);
+          if w.tx_frames + w.rx_frames > 0 { s += &format!("[emu] wifi: {} frames sent by the station, {} received ({} dropped: no descriptor){}\n", w.tx_frames, w.rx_frames, w.rx_dropped, w.ap.as_ref().map_or(String::new(), |ap| format!("; AP: {} beacons, {} probe responses, {} data frames from the station, {} dropped from a full queue, state {:?}", ap.stats.0, ap.stats.1, ap.stats.2, ap.queue_dropped, ap.state))); }
+          if let Some(r) = w.net.as_ref().and_then(|n| n.bridge_report()) { s += &r; s += "\n"; }
+          if let Some(n) = w.net.as_ref().filter(|n| n.bridge.is_none()) { s += &format!("[emu] net: {} DHCP leases, {} ARP replies, {} DNS answers, {} NTP answers, {} TCP refused, {} pings, {} frames ignored\n", n.dhcp_acks, n.arp_replies, n.dns_answers, n.ntp_answers, n.tcp_rejects, n.pings, n.unhandled);
             if let Some(t) = &n.nat { s += &format!("[emu] nat: {} TCP connections ({} failed), {} UDP flows ({} evicted, {} send errors), {} bytes out, {} bytes in\n", t.tcp_opened, t.tcp_refused, t.udp_flows, t.udp_evicted, t.udp_send_errors, t.bytes_to_host, t.bytes_to_guest);
                 if t.fwd_tcp + t.fwd_udp_in > 0 { s += &format!("[emu] hostfwd: {} TCP connections into the guest ({} refused or unanswered), {} UDP datagrams in, {} answers out\n", t.fwd_tcp, t.fwd_refused, t.fwd_udp_in, t.fwd_udp_out); } } } }
         { let (a, sh, r) = (&p.aes, &p.sha, &p.rsa);

@@ -238,9 +238,9 @@ impl SocBus {
             if let Some(f) = ap.data_from_ds(&e) { due.push(esp_soc::wifi::AirFrame { at_us: now_us, frame: f }); }
         }
         if due.is_empty() { return; }
-        due.sort_by_key(|a| (esp_soc::wifi::is_beacon(&a.frame), a.at_us));   // a connect exchange goes before beacons
+        due.sort_by_key(esp_soc::wifi::air_order);   // a connect exchange goes before beacons, beacons before data
         let first = due.remove(0);
-        ap.queue.extend(due);
+        ap.enqueue(due);
         self.wifi_rx_deliver(&first.frame, now_us);
     }
 
@@ -289,8 +289,10 @@ impl SocBus {
         let due = now_us.wrapping_sub(mac.net_polled_us) >= 500;
         if out.is_empty() && !due { return; }
         if due { mac.net_polled_us = now_us; }
-        for e in out { let r = net.handle(&e, now_us); mac.eth_rx.extend(r); }
-        let r = net.poll(now_us); mac.eth_rx.extend(r);
+        let mut r = Vec::new();
+        for e in out { r.extend(net.handle(&e, now_us)); }
+        r.extend(net.poll(now_us));
+        net.eth_rx_dropped += esp_soc::wifi::push_bounded(&mut mac.eth_rx, r, esp_soc::wifi::AIR_QUEUE_MAX);
     }
 
     fn spi2_dma_tx(&mut self) {

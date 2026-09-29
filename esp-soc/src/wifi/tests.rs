@@ -164,3 +164,107 @@ fn ap_configuration_rejects_unknown_options_and_invalid_values() {
         assert!(ApConfig::parse(spec).is_err(), "accepted {spec}");
     }
 }
+
+fn associated_ap() -> VirtualAp {
+    let mut ap = VirtualAp::new(config(), false);
+    ap.on_station_tx(&station_frame(11 << 4, &[0, 0, 1, 0, 0, 0]), 0);
+    ap.on_station_tx(&station_frame(0, &[1, 0, 0, 0]), 0);
+    assert_eq!(ap.state, StaState::Associated);
+    ap.queue.clear();
+    ap
+}
+
+fn lan_frame(n: u16) -> Vec<u8> {
+    let mut e = vec![0xff; 6];
+    e.extend_from_slice(&[2, 9, 9, 9, 9, 9]);
+    e.extend_from_slice(&[0x08, 0x00]);
+    e.extend_from_slice(&n.to_be_bytes());
+    e.resize(60, 0);
+    e
+}
+
+/// The S3's and C6's wifi_air_step: what is due, plus what the network sent, one frame on the air
+/// per 400 us, the rest back on the queue. Returns the times beacons reached the station.
+fn air(ap: &mut VirtualAp, until_us: u64, lan_per_step: u16, first_burst: u16) -> Vec<u64> {
+    let mut beacons = Vec::new();
+    let mut n = 0u16;
+    let mut now = 0;
+    while now < until_us {
+        let mut due = ap.step(now);
+        let burst = if now == 0 { first_burst } else { lan_per_step };
+        let mut eth_rx = Vec::new();
+        push_bounded(&mut eth_rx, (0..burst).map(|_| { n = n.wrapping_add(1); lan_frame(n) }), AIR_QUEUE_MAX);
+        for e in eth_rx { if let Some(f) = ap.data_from_ds(&e) { due.push(AirFrame { at_us: now, frame: f }); } }
+        if !due.is_empty() {
+            due.sort_by_key(air_order);
+            let first = due.remove(0);
+            if is_beacon(&first.frame) { beacons.push(now); }
+            ap.enqueue(due);
+        }
+        now += 400;
+    }
+    beacons
+}
+
+#[test]
+fn beacons_keep_their_interval_under_1000_queued_frames_and_a_steady_flood() {
+    // 1000 frames at once, then three per slot: more than the air delivers, for ten seconds (the
+    // station would drop the link after 6 s without a beacon, esp_wifi.h:1141-1142).
+    let mut ap = associated_ap();
+    let beacons = air(&mut ap, 10_000_000, 3, 1000);
+    let interval = ap.beacon_interval_us;
+    assert!(beacons.len() as u64 >= 10_000_000 / interval - 1, "{} beacons in 10 s", beacons.len());
+    let worst = beacons.windows(2).map(|w| w[1] - w[0]).max().unwrap();
+    assert!(worst <= interval + 400, "a {worst} us gap between beacons");
+    assert!(ap.queue.len() <= AIR_QUEUE_MAX);
+    assert!(ap.queue_dropped > 900);
+}
+
+#[test]
+fn only_a_management_exchange_holds_a_beacon_back() {
+    let mut ap = associated_ap();
+    for i in 0..10 { let f = ap.data_from_ds(&lan_frame(i)).unwrap(); ap.enqueue([AirFrame { at_us: 0, frame: f }]); }
+    let due = ap.step(ap.next_beacon_us);
+    assert!(due.iter().any(|a| is_beacon(&a.frame)), "queued data held the beacon back");
+    ap.queue.clear();
+    ap.on_station_tx(&station_frame(4 << 4, &[0, 0]), 0);                  // probe request: a response is queued
+    let t = ap.next_beacon_us;
+    ap.queue[0].at_us = t + 1_000;                                          // not due yet
+    assert!(!ap.step(t).iter().any(|a| is_beacon(&a.frame)));
+}
+
+#[test]
+fn the_air_queue_keeps_64_frames_losing_the_oldest_data_first() {
+    let mut ap = associated_ap();
+    ap.on_station_tx(&station_frame(4 << 4, &[0, 0]), 0);                  // one management frame
+    for i in 0..100 { let f = ap.data_from_ds(&lan_frame(i)).unwrap(); ap.enqueue([AirFrame { at_us: 0, frame: f }]); }
+    assert_eq!(ap.queue.len(), AIR_QUEUE_MAX);
+    assert_eq!(ap.queue_dropped, 100 + 1 - AIR_QUEUE_MAX as u64);
+    assert!(is_mgmt(&ap.queue[0].frame), "the management frame stays");
+    let first_data = &ap.queue[1].frame;
+    assert_eq!(&first_data[32..34], &(100 - 63u16).to_be_bytes(), "the newest 63 data frames stay");
+
+    let mut q: Vec<Vec<u8>> = Vec::new();
+    assert_eq!(push_bounded(&mut q, (0..100u16).map(lan_frame), AIR_QUEUE_MAX), 36);
+    assert_eq!(q.len(), AIR_QUEUE_MAX);
+    assert_eq!(q[0], lan_frame(36));
+}
+
+#[test]
+fn the_handshake_goes_before_queued_data_and_is_never_dropped_for_it() {
+    let mut cfg = config();
+    cfg.psk = Some("esp32sim-pass".into());
+    let mut ap = VirtualAp::new(cfg, false);
+    ap.on_station_tx(&station_frame(11 << 4, &[0, 0, 1, 0, 0, 0]), 0);
+    ap.on_station_tx(&station_frame(0, &[1, 0, 0, 0]), 0);                  // queues the assoc response and message 1
+    ap.queue.retain(|a| !is_mgmt(&a.frame));                                // the auth and assoc responses went out
+    let m1 = ap.queue.iter().find(|a| is_eapol(&a.frame)).unwrap().frame.clone();
+    for i in 0..200 { let f = ap.data_from_ds(&lan_frame(i)).unwrap(); ap.enqueue([AirFrame { at_us: 0, frame: f }]); }
+    assert!(ap.queue.iter().any(|a| a.frame == m1), "message 1 was dropped for data");
+    assert_eq!(ap.queue.len(), AIR_QUEUE_MAX);
+    let mut due = ap.step(1_000_000);
+    due.sort_by_key(air_order);
+    assert_eq!(due[0].frame, m1, "the handshake goes first");
+    assert!(is_beacon(&due[1].frame), "then the beacon");
+    assert!(due[2..].iter().all(|a| !is_mgmt(&a.frame) && !is_eapol(&a.frame)), "then data");
+}

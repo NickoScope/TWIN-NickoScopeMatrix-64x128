@@ -32,6 +32,20 @@ adopts whatever you give it. The AP is WPA2-PSK when `psk=` is present and open 
 gateway with an immediate RST, so applications fail fast instead of hanging — useful when you want a
 run to be reproducible and offline.
 
+`--net bridge:PATH` (macOS and Linux) puts the station on a real LAN instead: a
+[socket_vmnet](https://github.com/lima-vm/socket_vmnet) daemon in bridged mode, running as root,
+listens at PATH (for example `/var/run/socket_vmnet.bridged.en0`), and esp32sim connects to it as
+an ordinary user. The station's Ethernet frames go out as they are and the LAN's router gives it
+an address; none of the emulated services answer. The daemon floods every frame to every client,
+so only frames for the station's MAC (the source address of what it sends, `--mac` until then),
+broadcast and multicast are passed on. A reader thread empties the socket all the time, because a
+client that stops reading stalls the daemon for everyone (socket_vmnet issue #173); what the
+emulation has not taken in time is dropped. When the daemon goes away (sleep, a Wi-Fi reconnect)
+esp32sim reconnects with a growing delay. The counters (`rx_ok`, `rx_filtered`, `rx_dropped`, `tx`,
+`tx_dropped`, `reconnects`) are printed at the end of the run. Over Wi-Fi the host kernel rewrites
+the station's MAC to the host's own on the air (MAC-NAT), so the LAN's ARP tables show the host's
+MAC for the station's address; its own MAC still appears in DHCP.
+
 The same `--wifi` and `--net` work on the **ESP32-C6** (`esp32sim-c6`): the access point and the
 network are the same code, the MAC model is the C6's own ([wifi-c6-plan.md](wifi-c6-plan.md)). A C6
 radio run also needs `--stub bb_init=0`, and what has been tried is one station on one open or
