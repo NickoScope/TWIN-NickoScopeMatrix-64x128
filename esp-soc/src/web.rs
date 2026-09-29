@@ -216,7 +216,10 @@ fn handle_client(mut stream: TcpStream, shared: Arc<Mutex<Shared>>) {
     let Some(key) = key else {
         // plain HTTP: serve a file
         let path = text.split_whitespace().nth(1).unwrap_or("/").split('?').next().unwrap_or("/");
-        let path = if path == "/" { "/run.html" } else { path };
+        // A path ending in '/' is its directory's index.html, as web servers do: /flasher/ opens the
+        // twin's web flasher (twin.py builds it there).
+        let dir_index;
+        let path = if path == "/" { "/run.html" } else if path.ends_with('/') { dir_index = format!("{path}index.html"); dir_index.as_str() } else { path };
         let web_dir = shared.lock().unwrap().web_dir.clone();
         let body = static_file(&web_dir, path);
         let ctype = content_type(path);
