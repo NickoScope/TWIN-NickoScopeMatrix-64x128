@@ -929,12 +929,13 @@ fn read_flush_reports_terminal_i2s_and_lcd_dma_descriptors() {
             3 => { bus.periph.i2s0.write(0x2c, 15 << 13); bus.periph.i2s0.write(0x54, (1 << 16) | 3); bus.periph.i2s0.write(0x24, 4); bus.periph.i2s0.sample_rate = crate::periph::CPU_HZ as u32; }
             4 => { bus.periph.i2s1.write(0x2c, 15 << 13); bus.periph.i2s1.write(0x54, (1 << 16) | 3); bus.periph.i2s1.write(0x24, 4); bus.periph.i2s1.sample_rate = crate::periph::CPU_HZ as u32; }
             _ => {
+                bus.periph.lcd_cam.lcd_clock = (2 << 29) | (2 << 9) | (1 << 6);   // 240 MHz / 2: a pixel every 2 cycles
                 bus.periph.lcd_cam.lcd_user = 1 << 27;
                 bus.periph.lcd_cam.lcd_ctrl = 1 << 31;
                 bus.periph.lcd_cam.lcd_ctrl1 = 511 << 8;
             }
         }
-        read_flush(&mut bus, 1);
+        read_flush(&mut bus, 2);
         assert!(bus.periph.gdma.out[0].irq(), "DMA {peripheral}");
         assert!(bus.block_break(), "DMA {peripheral}");
     }

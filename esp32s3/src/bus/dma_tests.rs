@@ -4,6 +4,8 @@ const DESC: u32 = DRAM_LOW;
 const INPUT: u32 = DRAM_LOW + 0x100;
 const RX_DESC: u32 = DRAM_LOW + 0x200;
 const OUTPUT: u32 = DRAM_LOW + 0x300;
+/// The fastest LCD clock: PLL_D2 240 MHz / DIV_NUM 2, CLK_EQU_SYSCLK. 120 MHz, 2 CPU cycles a pixel.
+const LCD_FAST_CLOCK: u32 = (2 << 29) | (2 << 9) | (1 << 6);
 
 fn bus_with_out(peripheral: u32, length: u32, next: u32) -> SocBus {
     let mut bus = SocBus::new(1024, 1024, [0; 6]);
@@ -34,10 +36,11 @@ fn empty_streaming_descriptor_cycles_raise_error_and_stop() {
                 bus.dma_i2s_step(1);
             }
             _ => {
+                bus.periph.lcd_cam.lcd_clock = LCD_FAST_CLOCK;
                 bus.periph.lcd_cam.lcd_user = 1 << 27;
                 bus.periph.lcd_cam.lcd_ctrl = 1 << 31;
                 bus.periph.lcd_cam.lcd_ctrl1 = 511 << 8;
-                bus.dma_lcd_step(1);
+                bus.dma_lcd_step(2);
             }
         }
         assert!(!bus.periph.gdma.out[0].running, "peripheral {peripheral}");
@@ -194,10 +197,11 @@ fn streaming_dma_buffer_faults_raise_error_instead_of_emitting_zeros() {
             bus.dma_i2s_step(1);
             assert!(bus.periph.i2s0.pcm.is_empty());
         } else {
+            bus.periph.lcd_cam.lcd_clock = LCD_FAST_CLOCK;
             bus.periph.lcd_cam.lcd_user = 1 << 27;
             bus.periph.lcd_cam.lcd_ctrl = 1 << 31;
             bus.periph.lcd_cam.lcd_ctrl1 = 511 << 8;
-            bus.dma_lcd_step(1);
+            bus.dma_lcd_step(2);
             assert_eq!(bus.periph.lcd_cam.lcd_frames, 0);
         }
         assert!(!bus.periph.gdma.out[0].running);
@@ -220,5 +224,22 @@ fn crypto_owner_check_is_controlled_by_conf1() {
             bus.aes_dma_step();
             assert_eq!(bus.periph.aes.state == 2, !check_owner);
         }
+    }
+}
+
+#[test]
+fn lcd_clock_div_num_follows_the_trm_at_both_ends() {
+    // TRM §29.3.3.1: DIV_NUM 0 divides by 256, 1 by 2 (hub75::timing::lcd_pclk_hz agrees).
+    let mut lc = crate::periph::LcdCam::new();
+    for (div_num, hz) in [(0, 625_000), (1, 80_000_000), (2, 80_000_000), (16, 10_000_000)] {
+        lc.lcd_clock = (3 << 29) | (div_num << 9) | (1 << 6);
+        assert_eq!(lc.lcd_pclk_hz(), hz, "DIV_NUM {div_num}");
+        assert_eq!(lc.lcd_pclk_hz() as f64, hub75::timing::lcd_pclk_hz(hub75::timing::PLL_F160M_HZ, div_num, 0, 0, true, 0));
+    }
+    // The RGB path takes the same divider: a 1 x 1 frame lasts one PCLK.
+    lc.lcd_ctrl = 1 << 31;
+    for (div_num, cycles) in [(1, 3), (2, 3), (16, 24)] {
+        lc.lcd_clock = (3 << 29) | (div_num << 9) | (1 << 6);
+        assert_eq!(lc.lcd_geometry().3, cycles, "DIV_NUM {div_num}");
     }
 }

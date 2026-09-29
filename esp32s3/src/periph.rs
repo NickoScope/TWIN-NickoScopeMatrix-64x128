@@ -240,12 +240,17 @@ impl LcdCam {
     pub fn lcd_i8080_running(&self) -> bool { self.lcd_user & (1 << 27) != 0 && self.lcd_ctrl & (1 << 31) == 0 }
     /// Bytes per i8080 bus word: LCD_2BYTE_EN (USER bit 23) selects a 16-bit bus.
     pub fn lcd_bus_bytes(&self) -> usize { if self.lcd_user & (1 << 23) != 0 { 2 } else { 1 } }
+    /// The integer divider N of LCD_CLK. DIV_NUM holds N except at the ends of its 2..=256 range:
+    /// 0 is 256 and 1 is 2 (ESP32-S3 TRM §29.3.3.1 "LCD Clock", Register 29.1; IDF lcd_ll.h
+    /// lcd_ll_set_group_clock_coeff writes 0 for LCD_LL_CLK_FRAC_DIV_N_MAX = 256). The same mapping
+    /// as hub75::timing::lcd_pclk_hz; both PCLK paths below go through this one helper.
+    pub fn lcd_div_num(clock: u32) -> f64 { match (clock >> 9) & 0xff { 0 => 256.0, 1 => 2.0, v => v as f64 } }
     /// The pixel clock in Hz: source / (DIV_NUM + DIV_B/DIV_A), then / (CLKCNT_N + 1) unless
     /// CLK_EQU_SYSCLK (TRM, LCD_CAM clock). The HUB75 driver sets PLL_F160M, DIV_NUM 16 and
     /// CLK_EQU_SYSCLK: 10 MHz (gdma_lcd_parallel16.cpp).
     pub fn lcd_pclk_hz(&self) -> u64 {
         let src = match (self.lcd_clock >> 29) & 3 { 1 => 40_000_000f64, 2 => 240_000_000.0, _ => 160_000_000.0 };
-        let div_num = ((self.lcd_clock >> 9) & 0xff).max(1) as f64; let div_b = ((self.lcd_clock >> 17) & 0x3f) as f64; let div_a = ((self.lcd_clock >> 23) & 0x3f) as f64;
+        let div_num = Self::lcd_div_num(self.lcd_clock); let div_b = ((self.lcd_clock >> 17) & 0x3f) as f64; let div_a = ((self.lcd_clock >> 23) & 0x3f) as f64;
         let lcd_clk = src / (div_num + if div_a > 0.0 { div_b / div_a } else { 0.0 });
         let n = if self.lcd_clock & (1 << 6) != 0 { 1.0 } else { (self.lcd_clock & 0x3f) as f64 + 1.0 };
         (lcd_clk / n).max(1.0) as u64
@@ -258,7 +263,7 @@ impl LcdCam {
         let bpp = if self.lcd_user & (1 << 23) != 0 { 2 } else { 1 };
         // lcd_clk = src / (div_num + div_b/div_a); pclk = lcd_clk / (clkcnt_n + 1) unless CLK_EQU_SYSCLK
         let src = match (self.lcd_clock >> 29) & 3 { 1 => 40_000_000f64, 2 => 240_000_000.0, _ => 160_000_000.0 };
-        let div_num = ((self.lcd_clock >> 9) & 0xff).max(1) as f64; let div_b = ((self.lcd_clock >> 17) & 0x3f) as f64; let div_a = ((self.lcd_clock >> 23) & 0x3f) as f64;
+        let div_num = Self::lcd_div_num(self.lcd_clock); let div_b = ((self.lcd_clock >> 17) & 0x3f) as f64; let div_a = ((self.lcd_clock >> 23) & 0x3f) as f64;
         let lcd_clk = src / (div_num + if div_a > 0.0 { div_b / div_a } else { 0.0 });
         let n = if self.lcd_clock & (1 << 6) != 0 { 1.0 } else { (self.lcd_clock & 0x3f) as f64 + 1.0 };
         let pclk = (lcd_clk / n).max(1_000_000.0) as u64;
