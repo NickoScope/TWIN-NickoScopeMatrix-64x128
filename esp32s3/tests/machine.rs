@@ -363,6 +363,7 @@ fn reboot_keeps_what_silicon_keeps() {
     m.bus.periph.uart[0].tx_out = b"gone".to_vec();
     m.bus.periph.systimer.conf = 0xffff;
     m.bus.periph.spi0.jedec[2] = 0x18; m.bus.periph.spi1.jedec[2] = 0x18;   // a 16 MB flash chip
+    esp_soc::SocBus::set_psram_size(&mut m.bus, 16 << 20).unwrap();          // and a 128 Mbit PSRAM: MR2 0x8d
     m.cores[0].pc = IRAM;
     m.bus.periph.rtc.reset_cause = esp_periph::RST_SW_CPU;
     let cause = m.reboot();
@@ -373,9 +374,25 @@ fn reboot_keeps_what_silicon_keeps() {
     assert_eq!(p.rtc.ram.read(0x38), cause | (cause << 6));
     assert_eq!(p.i2s0.pcm, vec![1, 2, 3]);
     assert_eq!((p.spi0.jedec[2], p.spi1.jedec[2]), (0x18, 0x18), "the flash chip keeps its capacity, or IDF finds it smaller than the image header");
+    assert_eq!((p.spi0.psram_mr[2], p.spi1.psram_mr[2]), (0x8d, 0x8d), "the PSRAM keeps its density, or IDF maps half of it after a restart");
     assert!(p.uart[0].tx_out.is_empty() && p.systimer.conf == 0, "digital peripherals are fresh");
     assert_eq!(m.cores[0].pc(), RESET); assert_eq!(m.reboots, 1);
     assert!(!m.dump_regs().contains("core1:"), "core 1 is back in reset");
+}
+
+/// `--psram-mb` and the bus constructor size the array and MR2's density together; IDF v4.4.7
+/// sizes the PSRAM from MR2 alone (port/esp32s3/opiram_psram.c:264-267). 2 MB, the default, has
+/// no octal code and keeps the reset value's 64 Mbit, as before.
+#[test]
+fn psram_size_sets_the_mr2_density() {
+    let mut m = machine();
+    assert_eq!(m.bus.periph.spi1.psram_mr[2], 0x8b, "the default 2 MB array: MR2 unchanged");
+    esp_soc::SocBus::set_psram_size(&mut m.bus, 16 << 20).unwrap();
+    assert_eq!((m.bus.psram.len(), m.bus.periph.spi0.psram_mr[2], m.bus.periph.spi1.psram_mr[2]), (16 << 20, 0x8d, 0x8d));
+    esp_soc::SocBus::set_psram_size(&mut m.bus, 8 << 20).unwrap();
+    assert_eq!(m.bus.periph.spi1.psram_mr[2], 0x8b, "64 Mbit again");
+    let bus = esp32s3::bus::SocBus::new(8 << 20, 32 << 20, [0; 6]);
+    assert_eq!(bus.periph.spi1.psram_mr[2], 0x8f, "the constructor's size: 256 Mbit");
 }
 
 /// Review 6: a chip reset keeps the virtual network (lease, forwards, UDP) but the NAT forgets the

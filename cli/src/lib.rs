@@ -340,7 +340,10 @@ fn setup_s3(o: &Opts) -> esp32s3::Machine {
     m.bus.periph.lcd_cam.frame_cycles = (esp32s3::periph::CPU_HZ as f64 / o.cam_fps) as u64;
     if let Some(mb) = o.flash_mb { if mb != 8 { m.bus.set_flash_size(mb << 20); } }
     if let Some(id) = o.flash_id { m.bus.periph.spi0.jedec = id; m.bus.periph.spi1.jedec = id; }
-    if let Some(mb) = o.psram_mb { if mb != 2 { m.bus.set_psram_size(mb << 20).unwrap(); } }
+    if let Some(mb) = o.psram_mb {
+        if mb != 2 { m.bus.set_psram_size(mb << 20).unwrap(); }
+        if esp_periph::opi_psram_density(mb << 20).is_none() { eprintln!("[emu] --psram-mb {}: the octal PSRAM's MR2 can only report 4, 8, 16 or 32 MB; IDF will size it 8 MB, the reset value's 64 Mbit", mb); }
+    }
     if let Some(p) = &o.efuse_regs {
         let txt = std::fs::read_to_string(p).expect("efuse file");
         let mut n = 0;

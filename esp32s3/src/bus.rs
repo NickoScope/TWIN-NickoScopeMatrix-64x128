@@ -192,6 +192,7 @@ impl SocBus {
             usj: Default::default(), strap_latched: 0, reserved_reads: Default::default(),
         };
         let mut b = bus_uninit;
+        b.periph.spi0.set_psram_size(psram_size); b.periph.spi1.set_psram_size(psram_size);   // MR2 says how big `psram` is
         b.strap_latched = b.periph.gpio.strap;
         b.rebuild_page_table();
         b
