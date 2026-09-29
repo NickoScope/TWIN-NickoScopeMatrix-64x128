@@ -737,6 +737,7 @@ fn quiet_backstop_keeps_the_original_cadence_for_active_devices() {
         ("i2s1", |p| p.i2s1.tx_conf |= 1 << 2),
         ("camera", |p| p.lcd_cam.running = true),
         ("lcd", |p| { p.lcd_cam.lcd_user |= 1 << 27; p.lcd_cam.lcd_ctrl |= 1 << 31; }),
+        ("lcd-i8080", |p| p.lcd_cam.lcd_user |= 1 << 27),
         ("gdma-out", |p| p.gdma.out[0].running = true),
         ("wifi-tx", |p| p.wifi.tx_pending.push((0, 0))),
         ("wifi-ap", |p| p.wifi.ap = Some(crate::wifi::VirtualAp::new(crate::wifi::ApConfig {

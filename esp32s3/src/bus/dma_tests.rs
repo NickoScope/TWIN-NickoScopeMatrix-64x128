@@ -6,6 +6,9 @@ const RX_DESC: u32 = DRAM_LOW + 0x200;
 const OUTPUT: u32 = DRAM_LOW + 0x300;
 /// The fastest LCD clock: PLL_D2 240 MHz / DIV_NUM 2, CLK_EQU_SYSCLK. 120 MHz, 2 CPU cycles a pixel.
 const LCD_FAST_CLOCK: u32 = (2 << 29) | (2 << 9) | (1 << 6);
+/// The HUB75 driver's clock: PLL_F160M / DIV_NUM 16, CLK_EQU_SYSCLK. 10 MHz, 24 CPU cycles a word.
+const LCD_HUB75_CLOCK: u32 = (3 << 29) | (16 << 9) | (1 << 6);
+const CYCLES_PER_WORD: u64 = 24;
 
 fn bus_with_out(peripheral: u32, length: u32, next: u32) -> SocBus {
     let mut bus = SocBus::new(1024, 1024, [0; 6]);
@@ -242,4 +245,98 @@ fn lcd_clock_div_num_follows_the_trm_at_both_ends() {
         lc.lcd_clock = (3 << 29) | (div_num << 9) | (1 << 6);
         assert_eq!(lc.lcd_geometry().3, cycles, "DIV_NUM {div_num}");
     }
+}
+
+/// An i8080 LCD (RGB_MODE_EN clear) at 10 MHz with `user` in LCD_USER, START written through the register.
+fn start_i8080(bus: &mut SocBus, user: u32) {
+    bus.periph.lcd_cam.lcd_clock = LCD_HUB75_CLOCK;
+    bus.periph.lcd_cam.int_ena = 1 << 1;
+    bus.periph.lcd_cam.write(0x14, user | (1 << 27));
+}
+fn trans_done(bus: &SocBus) -> bool {
+    bus.periph.lcd_cam.read(0x6c) & (1 << 1) != 0 && bus.periph.lcd_cam.read(0x14) & (1 << 27) == 0
+}
+
+#[test]
+fn i8080_dummy_only_transaction_ends_without_fetching_data() {
+    // IDF v4.4.7 esp_lcd_new_i80_bus: lcd_ll_set_phase_cycles(dev, 0, 1, 0); lcd_ll_start(dev); then a
+    // busy-wait for TRANS_DONE. IDF 5.x also starts GDMA on a 4-byte buffer first: DOUT is clear, so
+    // the LCD must not take it.
+    let mut bus = bus_with_out(5, 4, 0);
+    start_i8080(&mut bus, 1 << 25);                                  // DUMMY, one cycle; no CMD, no DOUT
+    bus.dma_lcd_step(CYCLES_PER_WORD - 1);
+    assert!(!trans_done(&bus), "still in the dummy cycle");
+    bus.irq_dirty = false;
+    bus.dma_lcd_step(1);
+    assert!(trans_done(&bus));
+    assert!(bus.irq_dirty && bus.periph.lcd_cam.irq());
+    assert!(!bus.periph.lcd_cam.lcd_i8080_running());
+    let ch = bus.periph.gdma.out[0];
+    assert!(ch.running && ch.buf_pos == 0 && ch.int_raw == 0, "no data phase, nothing fetched");
+    assert_eq!(bus.periph.lcd_cam.i80_words, 0);
+    // CMD for two cycles plus DUMMY for four: six PCLKs.
+    let mut bus = bus_with_out(5, 4, 0);
+    start_i8080(&mut bus, (1 << 31) | (1 << 26) | (3 << 29) | (1 << 25));
+    bus.dma_lcd_step(6 * CYCLES_PER_WORD - 1);
+    assert!(!trans_done(&bus));
+    bus.dma_lcd_step(1);
+    assert!(trans_done(&bus));
+}
+
+#[test]
+fn i8080_data_phase_ends_with_the_chain_and_a_ring_never_ends() {
+    const ALWAYS_OUT_16BIT: u32 = (1 << 24) | (1 << 23) | (1 << 13) | (1 << 25);
+    // (b) A one-off chain (next == 0): the words are sent, then TRANS_DONE and START clear.
+    let mut bus = bus_with_out(5, 16, 0);
+    start_i8080(&mut bus, ALWAYS_OUT_16BIT);
+    bus.dma_lcd_step(4096 * CYCLES_PER_WORD);
+    assert!(trans_done(&bus));
+    assert_eq!(bus.periph.lcd_cam.i80_words, 8);
+    assert!(!bus.periph.gdma.out[0].running);
+    assert_ne!(bus.periph.gdma.out[0].int_raw & (1 << 3), 0, "OUT_TOTAL_EOF");
+    assert!(bus.irq_dirty);
+    // Nothing more streams once the transaction is over.
+    bus.dma_lcd_step(8192 * CYCLES_PER_WORD);
+    assert_eq!(bus.periph.lcd_cam.i80_words, 8);
+    // The HUB75 ring: the last `next` points back to the first, so the transaction never ends.
+    let mut bus = bus_with_out(5, 16, DESC);
+    start_i8080(&mut bus, ALWAYS_OUT_16BIT);
+    bus.dma_lcd_step(4096 * CYCLES_PER_WORD);
+    assert!(!trans_done(&bus));
+    assert!(bus.periph.lcd_cam.lcd_i8080_running() && bus.periph.gdma.out[0].running);
+    assert_eq!(bus.periph.lcd_cam.i80_words, 4096);
+    assert_eq!(bus.periph.lcd_cam.int_raw, 0);
+    // No GDMA channel on trigger 5: nothing can ever feed the data phase.
+    let mut bus = SocBus::new(1024, 1024, [0; 6]);
+    start_i8080(&mut bus, ALWAYS_OUT_16BIT);
+    bus.dma_lcd_step(4096 * CYCLES_PER_WORD);
+    assert!(trans_done(&bus));
+}
+
+#[test]
+fn i8080_without_always_out_sends_dout_cyclelen_plus_one_words() {
+    // (d) LCD_DOUT_CYCLELEN = 3: four words, from a ring that would go on forever.
+    let mut bus = bus_with_out(5, 16, DESC);
+    start_i8080(&mut bus, (1 << 24) | (1 << 23) | 3);
+    bus.dma_lcd_step(3 * CYCLES_PER_WORD);
+    assert!(!trans_done(&bus));
+    bus.dma_lcd_step(CYCLES_PER_WORD);
+    assert!(trans_done(&bus));
+    assert_eq!(bus.periph.lcd_cam.i80_words, 4);
+    assert_eq!(bus.periph.gdma.out[0].buf_pos, 8);
+    assert!(bus.periph.gdma.out[0].running);
+}
+
+#[test]
+fn i8080_lcd_reset_drops_the_words_counted_before_it() {
+    let mut bus = bus_with_out(5, 16, DESC);
+    start_i8080(&mut bus, (1 << 24) | (1 << 23) | (1 << 13));
+    bus.dma_lcd_step(4000 * CYCLES_PER_WORD);
+    assert_eq!(bus.periph.lcd_cam.i80_pending, 4000);
+    let user = bus.periph.lcd_cam.read(0x14);
+    bus.periph.lcd_cam.write(0x14, user | (1 << 28));                       // LCD_RESET
+    assert_eq!((bus.periph.lcd_cam.i80_pending, bus.periph.lcd_cam.i80_frac), (0, 0));
+    bus.dma_lcd_step(96 * CYCLES_PER_WORD);                                  // 4000 + 96 would be a batch
+    assert_eq!(bus.periph.lcd_cam.i80_words, 0);
+    assert_eq!(bus.periph.gdma.out[0].buf_pos, 0);
 }

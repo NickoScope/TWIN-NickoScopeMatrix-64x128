@@ -225,14 +225,15 @@ pub struct LcdCam { pub ram: RegRam, pub cam_ctrl: u32, pub cam_ctrl1: u32, pub 
                     // LCD side (RGB / DPI mode): the panel is refreshed from a GDMA out-channel on trigger 5
                     pub lcd_clock: u32, pub lcd_user: u32, pub lcd_ctrl: u32, pub lcd_ctrl1: u32, pub lcd_acc: u64, pub lcd_frames: u64, pub lcd_line: Vec<u8>, pub lcd_fifo: std::collections::VecDeque<u8>, pub lcd_log: bool,
                     // LCD side, i8080 mode with LCD_ALWAYS_OUT_EN: one bus word per PCLK for as long as the
-                    // GDMA out-channel on trigger 5 feeds it (a HUB75 panel's looping descriptor chain)
-                    pub i80_frac: u64, pub i80_pending: u64, pub i80_words: u64, pub i80_buf: Vec<u8> }
+                    // GDMA out-channel on trigger 5 feeds it (a HUB75 panel's looping descriptor chain).
+                    // `i80_txn` counts the words of the current transaction (LCD_START to TRANS_DONE).
+                    pub i80_frac: u64, pub i80_pending: u64, pub i80_words: u64, pub i80_txn: u64, pub i80_buf: Vec<u8> }
 impl Default for LcdCam { fn default() -> Self { Self::new() } }
 
 impl LcdCam {
     pub fn new() -> Self { LcdCam { ram: RegRam::new(), cam_ctrl: 0, cam_ctrl1: 0, int_raw: 0, int_ena: 0, running: false, frame_cycles: CPU_HZ / 10, acc: 0, frames: 0, dropped: 0,
                                     lcd_clock: 0, lcd_user: 0, lcd_ctrl: 0, lcd_ctrl1: 0, lcd_acc: 0, lcd_frames: 0, lcd_line: Vec::new(), lcd_fifo: std::collections::VecDeque::new(), lcd_log: false,
-                                    i80_frac: 0, i80_pending: 0, i80_words: 0, i80_buf: Vec::new() } }
+                                    i80_frac: 0, i80_pending: 0, i80_words: 0, i80_txn: 0, i80_buf: Vec::new() } }
     pub fn irq(&self) -> bool { self.int_raw & self.int_ena != 0 }
     /// LCD RGB mode running: LCD_START (USER bit 27) with LCD_RGB_MODE_EN (CTRL bit 31).
     pub fn lcd_running(&self) -> bool { self.lcd_user & (1 << 27) != 0 && self.lcd_ctrl & (1 << 31) != 0 }
@@ -240,6 +241,24 @@ impl LcdCam {
     pub fn lcd_i8080_running(&self) -> bool { self.lcd_user & (1 << 27) != 0 && self.lcd_ctrl & (1 << 31) == 0 }
     /// Bytes per i8080 bus word: LCD_2BYTE_EN (USER bit 23) selects a 16-bit bus.
     pub fn lcd_bus_bytes(&self) -> usize { if self.lcd_user & (1 << 23) != 0 { 2 } else { 1 } }
+    /// PCLK cycles of the phases before DOUT: LCD_CMD (bit 26) is 1 cycle, 2 with LCD_CMD_2_CYCLE_EN
+    /// (bit 31); LCD_DUMMY (bit 25) is LCD_DUMMY_CYCLELEN (bits 29..30) + 1 (lcd_cam_struct.h, LCD_USER).
+    pub fn lcd_preamble_cycles(&self) -> u64 {
+        let u = self.lcd_user;
+        (if u & (1 << 26) != 0 { 1 + u64::from(u >> 31) } else { 0 }) + if u & (1 << 25) != 0 { u64::from((u >> 29) & 3) + 1 } else { 0 }
+    }
+    /// The i8080 transaction is over: LCD_TRANS_DONE (LC_DMA_INT_RAW bit 1) rises and LCD_START clears.
+    /// TRANS_DONE is what IDF waits on: v4.4.7 esp_lcd_panel_io_i80.c busy-waits for it after a
+    /// dummy-only start in lcd_periph_trigger_quick_trans_done_event() and after each tx_param, and
+    /// its ISR moves the i80 queue on it (lcd_ll.h: LCD_LL_EVENT_TRANS_DONE = 1 << 1). LCD_START
+    /// clearing itself is inferred from drivers that poll it, `while (LCD_CAM.lcd_user.lcd_start);`
+    /// in ESP32-HUB75-MatrixPanel-DMA 3.0.14 gdma_lcd_parallel16.cpp:280 and the Adafruit_Protomatter
+    /// comment it carries ("The LCD peripheral stops transmitting at the end of the DMA xfer"), not
+    /// read in the TRM (not checked). Returns whether the LCD_CAM interrupt line may have changed.
+    pub fn i80_trans_done(&mut self) -> bool {
+        self.lcd_user &= !(1 << 27); self.i80_pending = 0; self.i80_frac = 0;
+        self.int_raw |= 1 << 1; self.int_ena & (1 << 1) != 0
+    }
     /// The integer divider N of LCD_CLK. DIV_NUM holds N except at the ends of its 2..=256 range:
     /// 0 is 256 and 1 is 2 (ESP32-S3 TRM §29.3.3.1 "LCD Clock", Register 29.1; IDF lcd_ll.h
     /// lcd_ll_set_group_clock_coeff writes 0 for LCD_LL_CLK_FRAC_DIV_N_MAX = 256). The same mapping
@@ -277,9 +296,11 @@ impl LcdCam {
     pub fn write(&mut self, off: u32, v: u32) {
         match off {
             0x00 => self.lcd_clock = v,
-            0x14 => { let was = self.lcd_running(); self.lcd_user = v;
-                      if v & (1 << 28) != 0 { self.lcd_line.clear(); self.lcd_fifo.clear(); self.lcd_acc = 0; }                       // LCD_RESET
+            0x14 => { let (was, was_i80) = (self.lcd_running(), self.lcd_i8080_running()); self.lcd_user = v;
+                      // LCD_RESET: nothing collected before it streams out afterwards (the i8080 words too)
+                      if v & (1 << 28) != 0 { self.lcd_line.clear(); self.lcd_fifo.clear(); self.lcd_acc = 0; self.i80_pending = 0; self.i80_frac = 0; self.i80_txn = 0; self.i80_buf.clear(); }
                       if !was && self.lcd_running() { self.lcd_line.clear(); self.lcd_acc = 0; }
+                      if !was_i80 && self.lcd_i8080_running() { self.i80_pending = 0; self.i80_frac = 0; self.i80_txn = 0; }   // a new i8080 transaction
                       if self.lcd_log { eprintln!("[lcd] USER <- {:#010x} (start {} reset {} update {})", v, v >> 27 & 1, v >> 28 & 1, v >> 20 & 1); } }
             0x18 => { if v & (1 << 27) != 0 { self.lcd_fifo.clear(); if self.lcd_log { eprintln!("[lcd] AFIFO reset"); } } self.ram.write(off, v); }   // LCD_MISC.AFIFO_RESET
             0x1c => self.lcd_ctrl = v, 0x20 => self.lcd_ctrl1 = v,

@@ -591,6 +591,15 @@ impl SocBus {
     /// rewriting that last `next` (ESP32-HUB75-MatrixPanel-DMA 3.0.14, gdma_lcd_parallel16.cpp,
     /// flip_dma_output_buffer). So every descriptor is read afresh, `next` included, as it is reached.
     /// The words go to the board in batches, stamped with the pixel clock.
+    ///
+    /// A transaction ends (LcdCam::i80_trans_done: TRANS_DONE, LCD_START cleared) when
+    /// (a) it has no data phase (LCD_DOUT clear): after its cmd and dummy cycles, nothing fetched;
+    /// (b) the chain runs out (`next == 0`), or the channel is stopped, has no descriptor or none is
+    ///     bound to trigger 5: nothing more can come. A HUB75 ring has no `next == 0` and never ends;
+    /// (d) without LCD_ALWAYS_OUT_EN, after LCD_DOUT_CYCLELEN + 1 words ("The cycles = this value + 1";
+    ///     always-out goes on "till LCD_CAM_LCD_START is cleared or LCD_CAM_LCD_RESET is set",
+    ///     lcd_cam_struct.h, LCD_USER).
+    /// An always-out transaction is seen to end at batch granularity, up to BATCH_WORDS PCLKs late.
     fn dma_lcd_i8080_step(&mut self, cycles: u64) {
         let pclk = self.periph.lcd_cam.lcd_pclk_hz();
         let hz = crate::periph::CPU_HZ;
@@ -599,20 +608,29 @@ impl SocBus {
         let words = lc.i80_frac / hz;
         lc.i80_frac -= words * hz;
         lc.i80_pending += words;
+        if lc.lcd_user & (1 << 24) == 0 {                                                  // (a) no DOUT phase
+            if lc.i80_pending >= lc.lcd_preamble_cycles() { self.irq_dirty |= lc.i80_trans_done(); }
+            return;
+        }
         const BATCH_WORDS: u64 = 4096;
-        if lc.i80_pending < BATCH_WORDS { return; }
+        let left = if lc.lcd_user & (1 << 13) != 0 { u64::MAX }                             // (d) DOUT_CYCLELEN + 1 words
+                   else { (u64::from(lc.lcd_user & 0x1fff) + 1).saturating_sub(lc.i80_txn) };
+        if lc.i80_pending < BATCH_WORDS.min(left) { return; }
         let bus_bytes = lc.lcd_bus_bytes();
-        let mut want = (lc.i80_pending as usize) * bus_bytes;
+        let batch = (lc.i80_pending.min(left) as usize) * bus_bytes;
+        let mut want = batch;
         lc.i80_pending = 0;
         let mut out = std::mem::take(&mut lc.i80_buf);
         out.clear();
         let log = lc.lcd_log;
+        let mut ended = true;                                                               // (b) no channel on trigger 5
         if let Some(ch) = self.periph.gdma.out_channel_for(5) {
+            ended = false;
             let mut walk = DescriptorWalk::new(GDMA_DESCRIPTOR_STEP_BUDGET);
             while want > 0 {
                 let c = self.periph.gdma.out[ch];
-                if !c.running || c.desc == 0 { break; }
-                let Ok((_, d)) = walk.read(self, c.desc) else { self.fail_dma_out(ch); break };
+                if !c.running || c.desc == 0 { ended = true; break; }                        // (b) stopped, or no descriptor
+                let Ok((_, d)) = walk.read(self, c.desc) else { self.fail_dma_out(ch); ended = true; break };
                 let (length, eof, buf, next) = (d.length, d.eof, d.buf, d.next);
                 let remaining = length.saturating_sub(c.buf_pos) as usize;
                 if remaining == 0 {
@@ -626,12 +644,12 @@ impl SocBus {
                     ch_ref.int_raw |= 1 << 0;
                     if eof { ch_ref.int_raw |= 1 << 1; ch_ref.eof_desc = c.desc; }
                     if ch_ref.int_raw & ch_ref.int_ena != 0 { self.irq_dirty = true; }
-                    if next == 0 { ch_ref.running = false; ch_ref.desc = 0; ch_ref.int_raw |= 1 << 3; self.irq_dirty = true; break; }
+                    if next == 0 { ch_ref.running = false; ch_ref.desc = 0; ch_ref.int_raw |= 1 << 3; self.irq_dirty = true; ended = true; break; }   // (b)
                     ch_ref.desc = next; ch_ref.buf_pos = 0;
                     continue;
                 }
                 let take = remaining.min(want);
-                if self.append_mapped_bytes(buf.wrapping_add(c.buf_pos), take, &mut out).is_err() { self.fail_dma_out(ch); break; }
+                if self.append_mapped_bytes(buf.wrapping_add(c.buf_pos), take, &mut out).is_err() { self.fail_dma_out(ch); ended = true; break; }
                 self.periph.gdma.out[ch].buf_pos += take as u32;
                 want -= take;
             }
@@ -640,7 +658,11 @@ impl SocBus {
             self.periph.lcd_cam.i80_words += (out.len() / bus_bytes) as u64;
             self.board.lcd_i8080(pclk, bus_bytes as u8, &out, false);
         }
-        self.periph.lcd_cam.i80_buf = out;
+        let lc = &mut self.periph.lcd_cam;
+        lc.i80_buf = out;
+        let sent = ((batch - want) / bus_bytes) as u64;
+        lc.i80_txn += sent;
+        if ended || (left != u64::MAX && sent >= left) { self.irq_dirty |= lc.i80_trans_done(); }   // (b), (d)
     }
 
     /// Gather a finite crypto transaction. Descriptor visits bound both runtime and allocation

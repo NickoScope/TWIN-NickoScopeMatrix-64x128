@@ -781,6 +781,8 @@ impl SocBus {
         let p = &self.periph;
         p.i2s0.tx_running() || p.i2s1.tx_running()
             || p.lcd_cam.running || p.lcd_cam.lcd_running()
+            // an i8080 transaction whose TRANS_DONE is still to come, also one with no GDMA behind it
+            || p.lcd_cam.lcd_i8080_running()
             // EX157: a running GDMA IN channel is passive. Its only producers are the camera
             // (lcd_cam.running), AES (dma_pending) and mem-to-mem (needs the OUT side running),
             // all listed here, so an armed-but-idle receive channel does not hold the cadence.
