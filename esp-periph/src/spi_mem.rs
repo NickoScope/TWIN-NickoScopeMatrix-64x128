@@ -81,18 +81,20 @@ impl SpiMem {
             let has_mosi = user & (1 << 27) != 0;
             if self.log { eprintln!("[spi1] usr cmd {:#04x} addr {:#x}{} miso {} mosi {}", c, addr, if has_addr { "" } else { " (no addr)" }, if has_miso { miso_bytes } else { 0 }, if has_mosi { mosi_bytes } else { 0 }); }
             match c {
-                0x03 | 0x0b | 0x3b | 0x6b | 0xbb | 0xeb => { let d = rd(addr, miso_bytes); self.set_w_bytes(&d); }
+                // 3-byte reads, their 4-byte forms (0x13 0x0c 0x3c 0x6c 0xbc 0xec), and the Macronix
+                // octal DTR read (0xEE, sent as the 16-bit command 0x11EE: the low byte goes first)
+                0x03 | 0x0b | 0x3b | 0x6b | 0xbb | 0xeb | 0x13 | 0x0c | 0x3c | 0x6c | 0xbc | 0xec | 0xee => { let d = rd(addr, miso_bytes); self.set_w_bytes(&d); }
                 0x9f => { let j = self.jedec; self.set_w_bytes(&j); }
-                0x05 => { let s = self.status; self.set_w_bytes(&[s as u8]); }
+                0x05 => { let s = self.status as u8; self.set_w_bytes(&[s, s]); }   // octal DTR reads it twice
                 0x35 => { let s = self.status; self.set_w_bytes(&[(s >> 8) as u8]); }
                 0x06 => self.status |= 0x02,                       // WREN: set WEL
                 0x04 => self.status &= !0x02,                      // WRDI
                 0x01 | 0x31 | 0x11 => self.status &= !0x02,        // WRSR*: latch consumed (keep QE set)
                 0x15 => self.set_w_bytes(&[0x00]),
-                0x02 | 0x32 | 0x38 => { let d = self.w_bytes(mosi_bytes); for (i, b) in d.iter().enumerate() { let x = addr as usize + i; if x < fsize { flash[x] &= *b; } } self.dirty.push((DirtyMem::Flash, addr as usize, d.len())); self.status &= !0x02; }
-                0x20 => { let a = (addr as usize) & !0xfff; for b in flash.iter_mut().take((a + 0x1000).min(fsize)).skip(a) { *b = 0xff; } self.dirty.push((DirtyMem::Flash, a, 0x1000)); self.status &= !0x02; }
+                0x02 | 0x32 | 0x38 | 0x12 | 0x34 | 0x3e => { let d = self.w_bytes(mosi_bytes); for (i, b) in d.iter().enumerate() { let x = addr as usize + i; if x < fsize { flash[x] &= *b; } } self.dirty.push((DirtyMem::Flash, addr as usize, d.len())); self.status &= !0x02; }
+                0x20 | 0x21 => { let a = (addr as usize) & !0xfff; for b in flash.iter_mut().take((a + 0x1000).min(fsize)).skip(a) { *b = 0xff; } self.dirty.push((DirtyMem::Flash, a, 0x1000)); self.status &= !0x02; }
                 0x52 => { let a = (addr as usize) & !0x7fff; for b in flash.iter_mut().take((a + 0x8000).min(fsize)).skip(a) { *b = 0xff; } self.dirty.push((DirtyMem::Flash, a, 0x8000)); self.status &= !0x02; }
-                0xd8 => { let a = (addr as usize) & !0xffff; for b in flash.iter_mut().take((a + 0x10000).min(fsize)).skip(a) { *b = 0xff; } self.dirty.push((DirtyMem::Flash, a, 0x10000)); self.status &= !0x02; }
+                0xd8 | 0xdc => { let a = (addr as usize) & !0xffff; for b in flash.iter_mut().take((a + 0x10000).min(fsize)).skip(a) { *b = 0xff; } self.dirty.push((DirtyMem::Flash, a, 0x10000)); self.status &= !0x02; }
                 0xc7 | 0x60 => { for b in flash.iter_mut() { *b = 0xff; } self.dirty.push((DirtyMem::Flash, 0, fsize)); self.status &= !0x02; }
                 _ => { if has_miso { self.set_w_bytes(&vec![0u8; miso_bytes]); } }
             }
