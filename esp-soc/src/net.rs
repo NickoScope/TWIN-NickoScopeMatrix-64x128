@@ -5,8 +5,8 @@
 //!   10.0.2.2  gateway / DHCP server  (MAC 02:53:49:4d:00:02)
 //!   10.0.2.3  DNS
 //!   10.0.2.15 the station
-//! Outbound traffic to the real world needs a NAT backend (docs/networking-plan.md); until then this
-//! answers everything on the local subnet.
+//! Traffic past the gateway goes to the NAT backend (nat.rs) when there is one; the DHCP lease
+//! recorded here tells it where forwarded host ports deliver.
 
 pub(crate) mod packet;
 use packet::{checksum, ethernet, ip_packet, transport_checksum, udp_packet, GATEWAY_MAC};
@@ -20,6 +20,8 @@ pub struct VirtualNet {
     pub log: bool,
     /// user-mode NAT to the host's network; None keeps everything inside the emulated subnet
     pub nat: Option<crate::nat::Nat>,
+    /// the station that took the last DHCP lease; forwarded host ports deliver to it
+    pub lease: Option<crate::nat::Station>,
     pub dhcp_acks: u64,
     pub dns_answers: u64,
     pub ntp_answers: u64,
@@ -39,7 +41,7 @@ impl VirtualNet {
     pub fn new(log: bool) -> Self {
         VirtualNet { gw_mac: GATEWAY_MAC, gw_ip: [10, 0, 2, 2], dns_ip: [10, 0, 2, 3],
                      sta_ip: [10, 0, 2, 15], mask: [255, 255, 255, 0],
-                     log, nat: None, dhcp_acks: 0, dns_answers: 0, ntp_answers: 0, tcp_rejects: 0, arp_replies: 0, pings: 0, unhandled: 0, now_us: 0 }
+                     log, nat: None, lease: None, dhcp_acks: 0, dns_answers: 0, ntp_answers: 0, tcp_rejects: 0, arp_replies: 0, pings: 0, unhandled: 0, now_us: 0 }
     }
 
     /// Handle one Ethernet frame from the station; returns frames to send back to it.
@@ -161,7 +163,11 @@ impl VirtualNet {
         udp.extend_from_slice(&((8 + b.len()) as u16).to_be_bytes()); udp.extend_from_slice(&[0, 0]);   // checksum optional in IPv4
         udp.extend_from_slice(&b);
 
-        if reply_type == 5 { self.dhcp_acks += 1; }
+        if reply_type == 5 {
+            self.dhcp_acks += 1;
+            self.lease = Some(crate::nat::Station { mac: *src, ip: self.sta_ip, gateway: self.gw_ip });
+            if let Some(nat) = &mut self.nat { nat.station = self.lease; }
+        }
         if self.log { eprintln!("[net] DHCP {} -> {} for {}.{}.{}.{}", if msg_type == 1 { "DISCOVER" } else { "REQUEST" },
                                 if reply_type == 2 { "OFFER" } else { "ACK" },
                                 self.sta_ip[0], self.sta_ip[1], self.sta_ip[2], self.sta_ip[3]); }
@@ -257,6 +263,25 @@ impl VirtualNet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dhcp_ack_records_the_lease_for_forwarded_ports() {
+        let mut net = VirtualNet::new(false);
+        net.nat = Some(crate::nat::Nat::new(false));
+        let mac = [0x44, 0x1b, 0xf6, 0x75, 0xdc, 0xe0];
+        let mut d = vec![0u8; 240];
+        d[0] = 1; d[1] = 1; d[2] = 6;
+        d[28..34].copy_from_slice(&mac);
+        d[236..240].copy_from_slice(&[0x63, 0x82, 0x53, 0x63]);
+        d.extend_from_slice(&[53, 1, 1, 255]);                              // DISCOVER
+        assert_eq!(net.dhcp(&d, &mac).len(), 1);
+        assert!(net.lease.is_none());
+        d[242] = 3;                                                          // REQUEST
+        assert_eq!(net.dhcp(&d, &mac).len(), 1);
+        let lease = crate::nat::Station { mac, ip: [10, 0, 2, 15], gateway: [10, 0, 2, 2] };
+        assert_eq!(net.lease, Some(lease));
+        assert_eq!(net.nat.as_ref().unwrap().station, Some(lease));
+    }
 
     #[test]
     fn ntp_fraction_converts_nanoseconds() {

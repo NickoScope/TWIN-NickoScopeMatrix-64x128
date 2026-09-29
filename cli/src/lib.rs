@@ -69,7 +69,7 @@ pub struct Opts {
     pub rom: Option<PathBuf>, pub bootloader: Option<String>, pub ptable: Option<String>, pub app: Option<String>, pub elfs: Vec<String>,
     pub flash_image: Option<String>, pub flash_at: Vec<String>, pub boot: Option<String>, pub flash_mb: Option<usize>, pub psram_mb: Option<usize>, pub flash_id: Option<[u8; 3]>, pub flash_persist: Option<String>, pub serial_hex: Vec<u8>,
     pub mac: Option<[u8; 6]>, pub strap: Option<u32>, pub reset_cause: Option<u32>, pub efuse_regs: Option<String>, pub regs_init: Option<String>,
-    pub board: String, pub wifi: Option<String>, pub net: String, pub cam_image: Option<String>, pub cam_fps: f64,
+    pub board: String, pub wifi: Option<String>, pub net: String, pub hostfwd: Vec<esp_soc::nat::HostFwd>, pub cam_image: Option<String>, pub cam_fps: f64,
     pub spi2_timing: bool, pub measured_te: bool,
     pub max_insns: u64, pub max_seconds: Option<f64>, pub script: Option<String>, pub serial: Option<String>,
     pub console: Option<String>, pub console_prefix: bool, pub realtime: bool, pub web_port: Option<u16>, pub web_dir: Option<String>, pub no_reboot: bool,
@@ -117,6 +117,8 @@ pub fn parse(args: &[String], default_chip: &str) -> Opts {
             "--measured-te" => o.measured_te = true,
             "--wifi" => o.wifi = Some(next()),
             "--net" => o.net = next(),
+            // A host port on 127.0.0.1 forwarded into the guest: tcp:8080-80, udp:4210-4210
+            "--hostfwd" => o.hostfwd.push(esp_soc::nat::HostFwd::parse(&next()).unwrap_or_else(|e| usage_error(&format!("--hostfwd {e}")))),
             "--cam-image" => o.cam_image = Some(next()),
             "--cam-fps" => o.cam_fps = next().parse().expect("fps"),
             "--max-insns" => o.max_insns = next().replace('_', "").parse().expect("max-insns"),
@@ -181,6 +183,23 @@ fn find_rom(name: &str) -> Option<PathBuf> {
     dirs.into_iter().rev().map(|d| d.join(name)).find(|p| p.exists())
 }
 
+/// Bind every `--hostfwd` rule on the NAT, or stop with the reason a port could not be had.
+fn attach_hostfwd(nat: &mut esp_soc::nat::Nat, o: &Opts) {
+    for rule in &o.hostfwd {
+        match nat.forward(*rule) {
+            Ok(at) => eprintln!("[emu] hostfwd {} {} -> guest port {} (after the DHCP lease)", if rule.udp { "udp" } else { "tcp" }, at, rule.guest_port),
+            Err(e) => usage_error(&format!("--hostfwd {}: cannot bind 127.0.0.1:{}: {}", rule, rule.host_port, e)),
+        }
+    }
+}
+
+/// `--hostfwd` needs the network behind `--wifi` with the NAT in front of it.
+fn check_hostfwd(o: &Opts) {
+    if o.hostfwd.is_empty() { return; }
+    if o.wifi.is_none() { usage_error("--hostfwd needs --wifi: there is no network to forward into"); }
+    if !(o.net == "nat" || o.net == "user") { usage_error("--hostfwd needs --net nat"); }
+}
+
 pub fn run_cli(default_chip: &str) {
     let args: Vec<String> = std::env::args().collect();
     let mut o = parse(&args, default_chip);
@@ -228,6 +247,7 @@ fn run_cooja(o: &mut Opts) {
 }
 
 fn setup_s3(o: &Opts) -> esp32s3::Machine {
+    check_hostfwd(o);
     let mut m = esp32s3::machine(o.mac.unwrap_or([0x44, 0x1b, 0xf6, 0x75, 0xdc, 0xe0]));
     m.bus.board = esp32s3::board::make_board(&o.board).unwrap_or_else(|| { eprintln!("unknown board '{}' (atech14, waveshare-cam, waveshare-lcd4b, waveshare-amoled18-v2, none)", o.board); std::process::exit(2) });
     if o.measured_te {
@@ -243,8 +263,9 @@ fn setup_s3(o: &Opts) -> esp32s3::Machine {
         m.bus.periph.wifi.ap = Some(esp32s3::wifi::VirtualAp::new(cfg, m.bus.debug.has("wifi-frames")));
         let mut net = esp32s3::net::VirtualNet::new(m.bus.debug.has("net"));
         if o.net == "nat" || o.net == "user" {
-            let nat = esp32s3::nat::Nat::new(m.bus.debug.has("net"));
+            let mut nat = esp32s3::nat::Nat::new(m.bus.debug.has("net"));
             eprintln!("[emu] NAT to the host network enabled (DNS via {}.{}.{}.{})", nat.resolver[0], nat.resolver[1], nat.resolver[2], nat.resolver[3]);
+            attach_hostfwd(&mut nat, o);
             net.nat = Some(nat);
         }
         eprintln!("[emu] virtual network: station {}.{}.{}.{}, gateway {}.{}.{}.{} (DHCP, ARP, ICMP, DNS, NTP)", net.sta_ip[0], net.sta_ip[1], net.sta_ip[2], net.sta_ip[3], net.gw_ip[0], net.gw_ip[1], net.gw_ip[2], net.gw_ip[3]);
@@ -285,13 +306,14 @@ fn setup_c3(o: &Opts) -> esp32c3::Machine {
     let mut m = esp32c3::machine(o.mac.unwrap_or([0x60, 0x55, 0xf9, 0x00, 0x11, 0x22]), o.flash_mb.unwrap_or(4) << 20);
     m.bus.set_flash_size(o.flash_mb.unwrap_or(4) << 20);   // the JEDEC capacity follows the size
     if !o.debug.is_empty() { let mut f = esp_soc::DebugFlags::from_env(); for d in &o.debug { f.parse(d); } m.set_debug(&f); }
-    for (flag, on) in [("--board", o.board != "atech14" && o.board != "none"), ("--wifi", o.wifi.is_some()), ("--cam-image", o.cam_image.is_some()), ("--psram-mb", o.psram_mb.is_some()), ("--efuse-regs", o.efuse_regs.is_some()), ("--regs-init", o.regs_init.is_some()), ("--regstat", o.regstat.is_some())] {
+    for (flag, on) in [("--board", o.board != "atech14" && o.board != "none"), ("--wifi", o.wifi.is_some()), ("--hostfwd", !o.hostfwd.is_empty()), ("--cam-image", o.cam_image.is_some()), ("--psram-mb", o.psram_mb.is_some()), ("--efuse-regs", o.efuse_regs.is_some()), ("--regs-init", o.regs_init.is_some()), ("--regstat", o.regstat.is_some())] {
         if on { eprintln!("{} is not available on the C3", flag); std::process::exit(2); }
     }
     m
 }
 
 fn setup_c6(o: &Opts) -> esp32c6::Machine {
+    check_hostfwd(o);
     let mut m = esp32c6::machine(o.mac.unwrap_or([0xdc, 0x1e, 0xd5, 0x6e, 0x8c, 0xdc]), o.flash_mb.unwrap_or(4) << 20);
     m.bus.set_flash_size(o.flash_mb.unwrap_or(4) << 20);   // the JEDEC capacity follows the size
     if !o.debug.is_empty() { let mut f = esp_soc::DebugFlags::from_env(); for d in &o.debug { f.parse(d); } m.set_debug(&f); }
@@ -302,7 +324,11 @@ fn setup_c6(o: &Opts) -> esp32c6::Machine {
         eprintln!("[emu] virtual AP '{}' bssid {} channel {} ({})", cfg.ssid, esp_soc::wifi::mac_str(&cfg.bssid), cfg.channel, if cfg.psk.is_some() { "WPA2-PSK" } else { "open" });
         m.bus.periph.wifi_mac.ap = Some(esp_soc::wifi::VirtualAp::new(cfg, m.bus.debug.has("wifi-frames")));
         let mut net = esp_soc::net::VirtualNet::new(m.bus.debug.has("net"));
-        if o.net == "nat" || o.net == "user" { net.nat = Some(esp_soc::nat::Nat::new(m.bus.debug.has("net"))); }
+        if o.net == "nat" || o.net == "user" {
+            let mut nat = esp_soc::nat::Nat::new(m.bus.debug.has("net"));
+            attach_hostfwd(&mut nat, o);
+            net.nat = Some(nat);
+        }
         eprintln!("[emu] virtual network: station {}.{}.{}.{}, gateway {}.{}.{}.{} (DHCP, ARP, ICMP, DNS, NTP)", net.sta_ip[0], net.sta_ip[1], net.sta_ip[2], net.sta_ip[3], net.gw_ip[0], net.gw_ip[1], net.gw_ip[2], net.gw_ip[3]);
         m.bus.periph.wifi_mac.net = Some(net);
     }

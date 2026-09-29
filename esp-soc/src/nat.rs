@@ -3,10 +3,15 @@
 //! TCP uses bounded buffers in both directions. SYN, data and FIN share one retransmission queue,
 //! so a dropped virtual-air frame cannot discard acknowledged guest bytes or strand a handshake.
 //! This is a small relay, without window scaling, SACK or congestion control.
+//!
+//! Host ports can also be forwarded inward (`--hostfwd`): an accepted host connection becomes a
+//! flow the relay opens toward the leased station, from the gateway address, and from then on it
+//! is the same `Tcp` flow as an outbound one. A forwarded UDP port delivers datagrams from the
+//! gateway and sends the guest's answers back to the last host peer.
 
 use std::collections::VecDeque;
 use std::io::{self, ErrorKind, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use crate::net::packet::{ethernet, ip_packet, transport_checksum, udp_packet, GATEWAY_MAC};
@@ -19,6 +24,15 @@ const TIME_WAIT_US: u64 = 30_000_000;
 const MAX_FLOWS: usize = 64;
 const MAX_CONNECTS: usize = 8;
 const UDP_BATCH: usize = 16;
+/// Host connections taken from one forwarded port per poll; the rest wait in the host's backlog.
+const MAX_ACCEPTS: usize = 8;
+/// How long a forwarded SYN may go unanswered. lwIP drops a SYN silently while the listener's
+/// backlog is full (tcp_in.c, tcp_listen_input), so a busy single-client server is waited for.
+const FORWARD_SYN_TIMEOUT_US: u64 = 30_000_000;
+/// Gateway-side ports of forwarded TCP flows: the dynamic range of RFC 6335 section 6.
+const EPHEMERAL: u16 = 49152;
+/// The largest UDP payload one unfragmented IPv4 packet carries over a 1500-byte MTU.
+const UDP_MAX_PAYLOAD: usize = 1500 - 20 - 8;
 const FIN: u8 = 0x01;
 const SYN: u8 = 0x02;
 const RST: u8 = 0x04;
@@ -27,6 +41,37 @@ const PSH: u8 = 0x08;
 
 fn ip(a: &[u8; 4]) -> Ipv4Addr { Ipv4Addr::from(*a) }
 fn address(a: &[u8; 4], port: u16) -> SocketAddr { SocketAddr::new(IpAddr::V4(ip(a)), port) }
+
+/// A host port forwarded into the guest: `--hostfwd tcp:8080-80`. The host side is always bound
+/// on 127.0.0.1, so the guest is reachable from this machine only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostFwd { pub udp: bool, pub host_port: u16, pub guest_port: u16 }
+
+impl HostFwd {
+    /// `tcp:HOSTPORT-GUESTPORT` or `udp:HOSTPORT-GUESTPORT`.
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let form = || format!("{spec:?}: expected tcp:HOSTPORT-GUESTPORT or udp:HOSTPORT-GUESTPORT");
+        let (proto, ports) = spec.split_once(':').ok_or_else(form)?;
+        let udp = match proto { "tcp" => false, "udp" => true, _ => return Err(form()) };
+        let (host, guest) = ports.split_once('-').ok_or_else(form)?;
+        let port = |p: &str| p.parse::<u16>().ok().filter(|&n| n != 0).ok_or_else(|| format!("{spec:?}: port {p:?} is not 1-65535"));
+        Ok(Self { udp, host_port: port(host)?, guest_port: port(guest)? })
+    }
+}
+
+impl std::fmt::Display for HostFwd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}-{}", if self.udp { "udp" } else { "tcp" }, self.host_port, self.guest_port)
+    }
+}
+
+/// Where forwarded traffic enters the guest: the station holding the DHCP lease, and the gateway
+/// address that forwarded connections and datagrams come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Station { pub mac: [u8; 6], pub ip: [u8; 4], pub gateway: [u8; 4] }
+
+enum Listener { Tcp(TcpListener), Udp { sock: UdpSocket, peer: Option<SocketAddr> } }
+struct Forward { rule: HostFwd, listener: Listener }
 
 // A permit belongs to the blocking connect worker, not its guest flow. Removing a flow with RST
 // must not free a slot while connect_timeout is still running on the host.
@@ -70,6 +115,8 @@ impl Sent {
 struct Tcp {
     guest_mac: [u8; 6], guest_ip: [u8; 4], guest_port: u16, dst_ip: [u8; 4], dst_port: u16,
     transport: Transport,
+    /// opened by the relay toward the guest (a forwarded host connection), not by a guest SYN
+    inbound: bool,
     guest_write: GuestWrite,
     host_closed: bool,
     our_seq: u32,
@@ -146,6 +193,21 @@ impl Tcp {
     fn closed(&self) -> bool {
         matches!(self.transport, Transport::Closed)
     }
+
+    /// The guest's SYN-ACK to a forwarded connection (RFC 9293 section 3.10.7.3, SYN-SENT): one
+    /// that acknowledges our SYN fixes the guest's sequence space; one that does not is answered
+    /// with a reset carrying its ACK as the sequence number. A repeated SYN-ACK means our ACK was
+    /// lost, so it is acknowledged again.
+    fn syn_ack(&mut self, seq: u32, ack: u32, flags: u8, window: u16) -> Vec<Vec<u8>> {
+        if flags & ACK == 0 { return Vec::new(); } // a simultaneous open is not what a server does
+        if self.handshake_pending() {
+            if ack != self.our_seq { return vec![self.segment(RST, &[], ack)]; }
+            self.guest_seq = seq.wrapping_add(1);
+            self.guest_window = window;
+            self.acknowledge(ack);
+        }
+        vec![self.segment(ACK, &[], self.our_seq)]
+    }
 }
 
 /// Preserve every unwritten byte across short writes and WouldBlock. Returns bytes actually sent.
@@ -173,24 +235,131 @@ struct Udp {
 pub struct Nat {
     tcp: Vec<Tcp>,
     udp: Vec<Udp>,
+    forwards: Vec<Forward>,
     isn: u32,
+    next_port: u16,
     pub resolver: [u8; 4],
+    /// the leased station; forwarded traffic waits on the host side until there is one
+    pub station: Option<Station>,
     pub log: bool,
     pub tcp_opened: u64, pub tcp_refused: u64, pub udp_flows: u64,
     pub udp_evicted: u64, pub udp_send_errors: u64,
     pub bytes_to_host: u64, pub bytes_to_guest: u64,
+    /// forwarded host connections opened toward the guest, and those it refused or never answered
+    pub fwd_tcp: u64, pub fwd_refused: u64,
+    /// forwarded datagrams delivered to the guest, and guest answers sent back to a host peer
+    pub fwd_udp_in: u64, pub fwd_udp_out: u64,
 }
 
 impl Nat {
     pub fn new(log: bool) -> Self {
-        Self { tcp: Vec::new(), udp: Vec::new(), isn: 0x1000, resolver: host_resolver(), log,
-            tcp_opened: 0, tcp_refused: 0, udp_flows: 0, udp_evicted: 0, udp_send_errors: 0, bytes_to_host: 0, bytes_to_guest: 0 }
+        Self { tcp: Vec::new(), udp: Vec::new(), forwards: Vec::new(), isn: 0x1000, next_port: EPHEMERAL,
+            resolver: host_resolver(), station: None, log,
+            tcp_opened: 0, tcp_refused: 0, udp_flows: 0, udp_evicted: 0, udp_send_errors: 0, bytes_to_host: 0, bytes_to_guest: 0,
+            fwd_tcp: 0, fwd_refused: 0, fwd_udp_in: 0, fwd_udp_out: 0 }
+    }
+
+    /// Listen on 127.0.0.1:`host_port` for the guest's `guest_port`. Returns the bound address
+    /// (port 0 picks one, which the rule then carries as its host port).
+    pub fn forward(&mut self, mut rule: HostFwd) -> io::Result<SocketAddr> {
+        let at = (Ipv4Addr::LOCALHOST, rule.host_port);
+        let (listener, local) = if rule.udp {
+            let sock = UdpSocket::bind(at)?;
+            sock.set_nonblocking(true)?;
+            let local = sock.local_addr()?;
+            (Listener::Udp { sock, peer: None }, local)
+        } else {
+            let listener = TcpListener::bind(at)?;
+            listener.set_nonblocking(true)?;
+            let local = listener.local_addr()?;
+            (Listener::Tcp(listener), local)
+        };
+        rule.host_port = local.port();
+        self.forwards.push(Forward { rule, listener });
+        Ok(local)
+    }
+
+    /// A gateway-side port no live flow uses, walking the dynamic range.
+    fn ephemeral_port(&mut self, gateway: &[u8; 4]) -> u16 {
+        loop {
+            let port = self.next_port;
+            self.next_port = port.checked_add(1).unwrap_or(EPHEMERAL);
+            if !self.tcp.iter().any(|c| c.dst_ip == *gateway && c.dst_port == port) { return port; }
+        }
+    }
+
+    /// Take waiting host connections and datagrams on forwarded ports into the guest. Without a
+    /// lease, or with the flow table full of live flows, they stay queued on the host side.
+    fn accept_forwards(&mut self, now_us: u64, out: &mut Vec<Vec<u8>>) {
+        let Some(st) = self.station else { return };
+        for f in 0..self.forwards.len() {
+            let rule = self.forwards[f].rule;
+            if let Listener::Udp { sock, peer } = &mut self.forwards[f].listener {
+                let mut buf = [0; 2048];
+                for _ in 0..UDP_BATCH {
+                    let Ok((n, from)) = sock.recv_from(&mut buf) else { break };
+                    if n > UDP_MAX_PAYLOAD {
+                        if self.log { eprintln!("[nat] hostfwd {} dropped a {}-byte datagram (larger than one unfragmented packet)", rule, n); }
+                        continue;
+                    }
+                    *peer = Some(from);
+                    if self.log { eprintln!("[nat] hostfwd {} {} bytes from {} -> guest", rule, n, from); }
+                    self.fwd_udp_in += 1;
+                    self.bytes_to_guest += n as u64;
+                    let udp = udp_packet(&st.gateway, &st.ip, rule.host_port, rule.guest_port, &buf[..n]);
+                    out.push(ethernet(&st.mac, &GATEWAY_MAC, 0x0800, &ip_packet(17, &st.gateway, &st.ip, &udp)));
+                }
+                continue;
+            }
+            for _ in 0..MAX_ACCEPTS {
+                let evict = if self.tcp.len() < MAX_FLOWS { None } else {
+                    match self.tcp.iter().position(|c| matches!(c.transport, Transport::TimeWait | Transport::Closed)) {
+                        Some(i) => Some(i),
+                        None => break,
+                    }
+                };
+                let Listener::Tcp(listener) = &self.forwards[f].listener else { break };
+                let (stream, peer) = match listener.accept() {
+                    Ok(accepted) => accepted,
+                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(e) => {
+                        if e.kind() != ErrorKind::WouldBlock && self.log { eprintln!("[nat] hostfwd {} accept failed: {}", rule, e); }
+                        break;
+                    }
+                };
+                if stream.set_nonblocking(true).is_err() { continue; }
+                let _ = stream.set_nodelay(true);
+                if let Some(i) = evict { self.tcp.remove(i); }
+                let port = self.ephemeral_port(&st.gateway);
+                self.isn = self.isn.wrapping_add(0x10000);
+                let mut c = Tcp { guest_mac: st.mac, guest_ip: st.ip, guest_port: rule.guest_port, dst_ip: st.gateway, dst_port: port,
+                    transport: Transport::Connected(stream), inbound: true, guest_write: GuestWrite::Open, host_closed: false,
+                    our_seq: self.isn, guest_seq: 0, guest_window: 0,
+                    to_host: VecDeque::new(), unacked: VecDeque::new(), last_activity_us: now_us };
+                out.push(c.send(SYN, Vec::new(), now_us));
+                self.tcp.push(c);
+                self.fwd_tcp += 1;
+                if self.log { eprintln!("[nat] hostfwd {} {} -> guest {}:{} from {}:{}", rule, peer, ip(&st.ip), rule.guest_port, ip(&st.gateway), port); }
+            }
+        }
     }
 
     /// Forward a UDP datagram through a connected socket, which accepts replies only from its peer.
     #[allow(clippy::too_many_arguments, reason = "packet fields stay explicit at the protocol boundary")]
     pub fn udp_out(&mut self, gmac: &[u8; 6], gip: &[u8; 4], sport: u16, dip: &[u8; 4], reply_src: &[u8; 4],
                    dport: u16, payload: &[u8], now_us: u64) {
+        // An answer to a forwarded datagram goes back to the host peer that sent the last one.
+        if self.station.is_some_and(|st| st.gateway == *reply_src) {
+            if let Some(f) = self.forwards.iter().find(|f| f.rule.udp && f.rule.host_port == dport && f.rule.guest_port == sport) {
+                if let Listener::Udp { sock, peer: Some(peer) } = &f.listener {
+                    match sock.send_to(payload, peer) {
+                        Ok(n) => { self.fwd_udp_out += 1; self.bytes_to_host += n as u64; }
+                        Err(e) => { self.udp_send_errors += 1; if self.log { eprintln!("[nat] hostfwd {} reply to {} failed: {}", f.rule, peer, e); } }
+                    }
+                }
+                return;
+            }
+        }
         let idx = self.udp.iter().position(|f| f.guest_ip == *gip && f.guest_port == sport && f.dst_ip == *dip && f.dst_port == dport);
         let idx = match idx {
             Some(i) => i,
@@ -249,7 +418,7 @@ impl Nat {
             if let Some(i) = evict { self.tcp.remove(i); }
             self.isn = self.isn.wrapping_add(0x10000);
             self.tcp.push(Tcp { guest_mac: *gmac, guest_ip: *gip, guest_port: sport, dst_ip: *dip, dst_port: dport,
-                transport: Transport::Connecting(pending), guest_write: GuestWrite::Open, host_closed: false,
+                transport: Transport::Connecting(pending), inbound: false, guest_write: GuestWrite::Open, host_closed: false,
                 our_seq: self.isn, guest_seq: seq.wrapping_add(1), guest_window: window,
                 to_host: VecDeque::new(), unacked: VecDeque::new(), last_activity_us: now_us });
             if self.log { eprintln!("[nat] TCP {}:{} -> {}:{} connecting", ip(gip), sport, ip(dip), dport); }
@@ -258,13 +427,24 @@ impl Nat {
         let Some(i) = idx else { return Vec::new() };
         let c = &mut self.tcp[i];
         c.last_activity_us = now_us;
-        if flags & RST != 0 { c.transport = Transport::Closed; return Vec::new(); }
+        if flags & RST != 0 {
+            let refused = c.inbound && c.handshake_pending();
+            c.transport = Transport::Closed;
+            if refused {
+                self.fwd_refused += 1;
+                if self.log { eprintln!("[nat] hostfwd: guest port {} refused the connection", sport); }
+            }
+            return Vec::new();
+        }
         if matches!(c.transport, Transport::TimeWait) {
             return if flags & FIN != 0 { vec![c.segment(ACK, &[], c.our_seq)] } else { Vec::new() };
         }
         if flags & SYN != 0 {
+            if c.inbound { return c.syn_ack(seq, ack, flags, window); }
             return if c.handshake_pending() { vec![c.segment(SYN | ACK, &[], c.unacked[0].seq)] } else { Vec::new() };
         }
+        // SYN-SENT accepts only a SYN-ACK or a reset (RFC 9293 section 3.10.7.3).
+        if c.inbound && c.handshake_pending() { return Vec::new(); }
         if !matches!(c.transport, Transport::Connected(_)) { return Vec::new(); }
         if flags & ACK != 0 { c.acknowledge(ack); c.guest_window = window; }
         if c.handshake_pending() { return Vec::new(); }
@@ -278,8 +458,16 @@ impl Nat {
     /// Pump a bounded amount of host traffic, then retransmit and expire flows.
     pub fn poll(&mut self, now_us: u64) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
+        self.accept_forwards(now_us, &mut out);
         for c in &mut self.tcp {
             if c.closed() { continue; }
+            // A forwarded SYN's retransmissions do not refresh the flow, so this counts from the accept.
+            if c.inbound && c.handshake_pending() && now_us.wrapping_sub(c.last_activity_us) >= FORWARD_SYN_TIMEOUT_US {
+                if self.log { eprintln!("[nat] hostfwd: guest port {} never answered, closing the host connection", c.guest_port); }
+                self.fwd_refused += 1;
+                c.transport = Transport::Closed;
+                continue;
+            }
             if c.host_closed && c.guest_write == GuestWrite::Closed && c.unacked.is_empty()
                 && matches!(c.transport, Transport::Connected(_)) {
                 // Release the host socket but keep enough state to re-ACK a lost final ACK.

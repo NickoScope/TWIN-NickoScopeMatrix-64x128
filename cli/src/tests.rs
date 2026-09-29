@@ -111,3 +111,11 @@ fn timing_cycle_values_report_usage_errors() {
         assert_eq!(timing_cycles("4294967295", name), Ok(u32::MAX));
     }
 }
+
+#[test]
+fn hostfwd_rules_are_repeatable() {
+    let args: Vec<String> = ["esp32sim", "--hostfwd", "tcp:8080-80", "--hostfwd", "udp:4210-4210"].iter().map(|s| s.to_string()).collect();
+    let o = parse(&args, "s3");
+    assert_eq!(o.hostfwd, [esp_soc::nat::HostFwd { udp: false, host_port: 8080, guest_port: 80 },
+                           esp_soc::nat::HostFwd { udp: true, host_port: 4210, guest_port: 4210 }]);
+}
