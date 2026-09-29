@@ -21,6 +21,7 @@ LEDs would show, and can operate the IR remote and the knob. The fork's work is 
   - An SD/MMC host with an empty slot.
   - The radio's IQ calibration completing without an AP.
   - A chip reset that keeps the virtual AP and network.
+  - The timer groups' main watchdogs (MWDT, the Task and Interrupt WDTs of ESP-IDF 4.4): four stages, feeding, write protection, the TG0/TG1 WDT interrupts, TG0WDT/TG1WDT resets, and TIMG0's flash boot protection.
 - **Network and flashing**
   - `--hostfwd tcp|udp:HOST-GUEST`: inbound forwarding on 127.0.0.1.
   - `--net bridge:PATH`: the guest on the real LAN through socket_vmnet (vmnet bridged).

@@ -11,6 +11,11 @@ pub const RST_RTCWDT_CPU: u32 = 13; pub const RST_RTCWDT_RTC: u32 = 16;
 /// reset", 0x16 "USB (JTAG) reset"); the names are the ROM's (IDF 5.5.4
 /// esp_rom/esp32s3/include/esp32s3/rom/rtc.h:90-91, soc/esp32s3/include/soc/reset_reasons.h:59-60).
 pub const RST_USB_UART_CHIP: u32 = 0x15; pub const RST_USB_JTAG_CHIP: u32 = 0x16;
+/// A timer group's MWDT reset the digital core (stage action "reset system") or the CPU (action
+/// "reset CPU"): IDF 4.4.7 esp_rom/include/esp32s3/rom/rtc.h:76-77, 80, 85 (TG0WDT_SYS_RESET 7,
+/// TG1WDT_SYS_RESET 8, TG0WDT_CPU_RESET 11, TG1WDT_CPU_RESET 17); soc/esp32s3/include/soc/
+/// reset_reasons.h:43-46, 54 (RESET_REASON_CORE_MWDT0/1, _CPU0_MWDT0, _CPU0_MWDT1).
+pub const RST_TG0WDT_SYS: u32 = 7; pub const RST_TG1WDT_SYS: u32 = 8; pub const RST_TG0WDT_CPU: u32 = 11; pub const RST_TG1WDT_CPU: u32 = 17;
 pub fn reset_cause_name(c: u32) -> &'static str {
     match c { 1 => "POWERON", 3 => "RTC_SW_SYS_RESET", 5 => "DEEPSLEEP", 7 => "TG0WDT_SYS_RESET", 8 => "TG1WDT_SYS_RESET", 9 => "RTCWDT_SYS_RESET", 11 => "TG0WDT_CPU_RESET",
             12 => "RTC_SW_CPU_RESET", 13 => "RTCWDT_CPU_RESET", 15 => "RTCWDT_BROWN_OUT_RESET", 16 => "RTCWDT_RTC_RESET", 17 => "TG1WDT_CPU_RESET", 18 => "SUPER_WDT_RESET",
@@ -24,7 +29,8 @@ pub struct RtcCntl { pub ram: RegRam, pub slow_ticks: u64, pub time_latch: u64, 
                      wdt_base: u32, wdt_count: u64, wdt_stage: usize, wdt_unlocked: bool }
 impl RtcCntl {
     pub fn preset_after_bootloader(&mut self) { self.ram.write(0xc0, 0xFFD7_0028); self.ram.write(0xc4, 0xFF0F_00F0); }
-    fn request_reset(&mut self, cause: u32) { if !self.sw_reset { self.sw_reset = true; self.reset_cause = cause; } }
+    /// Reset the chip with `cause`, unless a reset is already pending (the first cause stands).
+    pub fn request_reset(&mut self, cause: u32) { if !self.sw_reset { self.sw_reset = true; self.reset_cause = cause; } }
     /// Advance the watchdog by RTC slow-clock ticks.
     pub fn wdt_tick(&mut self, ticks: u64) {
         let conf0 = self.ram.read(self.wdt_base);

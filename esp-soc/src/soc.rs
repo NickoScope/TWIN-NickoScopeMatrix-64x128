@@ -98,6 +98,10 @@ pub trait SocBus: Bus {
     fn boot_app(&mut self, app_off: usize) -> Result<u32, String>;
     /// Chip reset: re-create the digital peripherals, keep what survives on silicon. Returns the cause.
     fn reboot(&mut self, mac: [u8; 6]) -> u32;
+    /// Core 0 starts at the ROM's reset vector (`Machine::boot_rom`, every chip reset): the boot
+    /// that hardware watches where the chip models it (ESP32-S3: TIMG0's flash boot protection).
+    /// Code the emulator places and enters itself skips that boot.
+    fn rom_boot(&mut self) {}
     fn sw_reset(&self) -> bool;
     /// The board's reset button: the chip resets with this cause at the next scheduling round,
     /// through the same path as a reset the firmware asked for.

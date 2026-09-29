@@ -302,7 +302,7 @@ impl<S: Soc> Machine<S> {
     }
 
     /// Cold boot from the mask ROM reset vector (needs ROM + flash image with bootloader).
-    pub fn boot_rom(&mut self) { self.cores[0].reset(); }
+    pub fn boot_rom(&mut self) { self.bus.rom_boot(); self.cores[0].reset(); }
 
     /// Chip reset (software / watchdog): cores back to the reset vector, digital peripherals
     /// re-initialised; SRAM, RTC memories, efuses and the RTC-domain registers survive, as on
@@ -312,6 +312,7 @@ impl<S: Soc> Machine<S> {
         let pc = self.cores[0].pc();
         self.bus.note_pc(pc);
         let cause = self.bus.reboot(self.mac);
+        self.bus.rom_boot();   // an app-mode restart then enters the app as the bootloader leaves it (`boot_app`)
         for (i, c) in self.cores.iter_mut().enumerate() { S::reset_core(c, i); if i > 0 { self.core_held[i] = true; } }
         self.reboots += 1;
         self.usj_after_reboot();
