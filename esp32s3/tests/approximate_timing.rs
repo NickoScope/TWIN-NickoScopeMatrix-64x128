@@ -94,3 +94,30 @@ fn modeled_self_modifying_code_invalidates_through_the_dram_alias() {
     assert_eq!(machine.cores[0].get_ar(2), 6, "the second ADDI must use the rewritten immediate");
     assert_eq!(machine.cores[0].insn_count, 4);
 }
+
+/// Review 9: a fractional CPI (`--cpi 2.05`: base 2, 13/256) keeps a busy core's CCOUNT on the bus
+/// clock across `run` calls and chip resets. Each call used to start its rounds at the base CPI
+/// while the cores kept base + 1 from the last round of the call before, so CCOUNT ran ahead of
+/// the bus by up to a quantum per round until the next switch.
+#[test]
+fn fractional_cpi_keeps_ccount_on_the_bus_clock_across_run_calls_and_reboots() {
+    let mut machine = esp32s3::machine([0; 6]);
+    let pc = 0x4038_0000;
+    esp_soc::SocBus::load_bytes(&mut machine.bus, pc, &[0x06, 0xff, 0xff]).unwrap(); // j .
+    machine.cores[0].pc = pc;
+    machine.set_approximate_jit_timing(2, 64).unwrap();
+    machine.set_approximate_cpi_fraction(13).unwrap();
+    let mut wrapped = 0;
+    for call in 0..200 {
+        if call == 100 { machine.reboot(); machine.cores[0].pc = pc; }
+        let before = esp_soc::SocBus::cycles(&machine.bus);
+        assert!(matches!(machine.run(64), esp_soc::Stop::MaxInsns));
+        let cycles = esp_soc::SocBus::cycles(&machine.bus);
+        if machine.cores[0].approximate_cpi == 3 { wrapped += 1; }
+        assert_eq!(machine.cores[0].ccount as u64, cycles, "call {call} ({before}..{cycles}): CCOUNT left the bus clock");
+    }
+    assert!(wrapped >= 5, "some calls must end on a base + 1 round ({wrapped})");
+    let cycles = esp_soc::SocBus::cycles(&machine.bus) as f64;
+    let per_insn = cycles / machine.cores[0].insn_count as f64;
+    assert!((per_insn - (2.0 + 13.0 / 256.0)).abs() < 0.01, "average CPI {per_insn}");
+}
