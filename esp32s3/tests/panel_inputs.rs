@@ -107,3 +107,40 @@ fn the_page_drives_the_board_verbs_and_bad_lines_are_dropped() {
     assert!(ev.iter().any(|e| e.1 == PIN_ENC_B && e.2), "anticlockwise: B leads");
     assert!(!bit(&m, PIN_GPIO0), "the switch is still held down");
 }
+
+/// Review 5: BOOT (or the knob's switch) held through the board's RESET, a power-on Chip Reset,
+/// latches GPIO0 = 0 with IO46 = 0 (R60 pull-down): joint download boot, as on the hardware and
+/// as the firmware's `control.cpp` expects. Released, the next reset boots from SPI flash. A
+/// software reset does not sample the pins. Only GPIO_STRAPPING[3:2] follow the board.
+#[test]
+fn boot_held_through_a_power_on_reset_latches_download_mode() {
+    let mut m = machine();
+    let hold = |m: &mut esp32s3::Machine, verb: &str, line: &str| {
+        m.bus.board_input(verb, line).unwrap();
+        m.max_cycles = m.bus.cycles + 10 * 240_000;           // 10 ms: the edge lands, the core sleeps
+        assert!(matches!(m.run(u64::MAX), Stop::Halted));
+    };
+    let reset = |m: &mut esp32s3::Machine, cause: u32| -> u32 {
+        m.bus.request_reset(cause);
+        assert_eq!(m.reboot(), cause);
+        m.cores[0].pc = IRAM; m.cores[0].ps = 0;             // back to the sleeping loop (SRAM survives)
+        m.bus.periph.gpio.strap
+    };
+    m.bus.periph.gpio.strap = 0x2f;                         // --strap: bit 5 is not the board's
+    hold(&mut m, "boot", "down");
+    assert!(!bit(&m, PIN_GPIO0));
+    let strap = reset(&mut m, esp_periph::RST_SW_SYS);
+    assert_eq!(strap, 0x2f, "a software reset keeps the latch");
+    let strap = reset(&mut m, esp_periph::RST_RTCWDT_RTC);
+    assert_eq!(strap, 0x2f, "an RTC watchdog System Reset keeps the latch (TRM Table 7.1-1)");
+    let strap = reset(&mut m, esp_periph::RST_POWERON);
+    assert_eq!(strap & 0x0c, 0, "GPIO0 = 0, GPIO46 = 0: joint download (boot_mode.h IS_00XX)");
+    assert_eq!(strap, 0x23, "the other bits stay as --strap set them");
+    assert!(!bit(&m, PIN_GPIO0), "BOOT is still held after the reset");
+    hold(&mut m, "boot", "up");
+    let strap = reset(&mut m, esp_periph::RST_POWERON);
+    assert_eq!(strap, 0x2b, "GPIO0 = 1: SPI boot (IS_1XXX); IO46 rests low");
+    // The knob's switch is on the same wired-AND.
+    hold(&mut m, "sw", "down");
+    assert_eq!(reset(&mut m, esp_periph::RST_POWERON) & 0x0c, 0);
+}
