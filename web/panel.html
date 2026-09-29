@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="en">
+<html lang="ru">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>NickoScope Twin</title>
+<title>Двойник панели NickoScope</title>
 <style>
   /* One deliberate world: a dark room with the panel in it. */
   :root {
@@ -70,67 +70,67 @@
 </head>
 <body>
 <header>
-  <h1>NickoScope <span>Twin</span></h1>
-  <span class="chip"><i class="dot" id="conn"></i><span id="connText">connecting</span></span>
-  <span class="chip" id="board">board —</span>
-  <a class="chip" id="portalLink" href="http://127.0.0.1:8080/" target="_blank" rel="noopener" title="The firmware's own web portal, forwarded from the twin's port 80 (twin.py run --http)">portal ↗</a>
+  <h1>NickoScope <span>двойник</span></h1>
+  <span class="chip"><i class="dot" id="conn"></i><span id="connText">подключение</span></span>
+  <span class="chip" id="board">плата —</span>
+  <a class="chip" id="portalLink" href="http://127.0.0.1:8080/" target="_blank" rel="noopener" title="Собственный веб-портал прошивки: порт 80 двойника, проброшенный на Mac (twin.py run --http)">портал ↗</a>
   <div class="stats">
-    <span>time <b id="stTime">—</b></span>
-    <span>refresh windows/s <b id="stFps">—</b></span>
-    <span>behind <b id="stBehind">—</b></span>
+    <span>время <b id="stTime">—</b></span>
+    <span>кадров/с <b id="stFps">—</b></span>
+    <span>отставание <b id="stBehind">—</b></span>
   </div>
 </header>
 <main>
   <div class="stage">
-    <div class="frame"><canvas id="panel" width="1024" height="512" aria-label="The LED panel as the real firmware drives it"></canvas></div>
+    <div class="frame"><canvas id="panel" width="1024" height="512" aria-label="Светодиодная панель так, как её ведёт настоящая прошивка"></canvas></div>
     <div class="look">
-      <label>Exposure <input id="exposure" type="range" min="0.25" max="4" step="0.05" value="1"></label>
-      <label>GOB glow <input id="glow" type="range" min="0" max="1" step="0.05" value="0.55"></label>
-      <label><input id="dots" type="checkbox" checked> LED dots</label>
-      <label>Seen by <select id="shutter">
-        <option value="eye">an eye (1/60 s)</option>
-        <option value="250">a camera, 1/250 s</option>
-        <option value="1000">a camera, 1/1000 s</option>
-        <option value="4000">a camera, 1/4000 s</option>
-        <option value="16000">a camera, 1/16000 s</option>
+      <label>Экспозиция <input id="exposure" type="range" min="0.25" max="4" step="0.05" value="1"></label>
+      <label>Свечение GOB <input id="glow" type="range" min="0" max="1" step="0.05" value="0.55"></label>
+      <label><input id="dots" type="checkbox" checked> Точки светодиодов</label>
+      <label>Смотрит <select id="shutter">
+        <option value="eye">глаз (1/60 с)</option>
+        <option value="250">камера, 1/250 с</option>
+        <option value="1000">камера, 1/1000 с</option>
+        <option value="4000">камера, 1/4000 с</option>
+        <option value="16000">камера, 1/16000 с</option>
       </select></label>
-      <button id="snap" type="button">Save PNG</button>
+      <button id="snap" type="button">Сохранить PNG</button>
     </div>
-    <p class="note">Light is counted per LED from the HUB75 bitstream the firmware clocks out of LCD_CAM, over whole refreshes: 1.0 is an LED lit for its entire row slot of the 1/32 scan. Glow, dot size and exposure are a look, not yet calibrated against photos of the panel.</p>
+    <p class="note">Свет каждого светодиода считается по потоку HUB75, который прошивка выводит через LCD_CAM, за целые кадры развёртки: 1,0 — светодиод горел всё время своей строки при развёртке 1/32. Свечение, размер точек и экспозиция — пока на глаз, по фото панели ещё не выверены.</p>
   </div>
   <aside>
     <section class="card">
-      <h2>IR remote</h2>
+      <h2>ИК-пульт</h2>
       <div class="remote" id="remote">
         <div class="ir"><i id="irled"></i></div>
       </div>
-      <p class="hint">Click to press; hold to send NEC repeat frames. The receiver on GPIO0 decodes them in the firmware, as on the panel.</p>
+      <p class="hint">Нажмите — одно нажатие; удерживайте — пойдут повторы NEC. Приёмник на GPIO0 декодирует их в самой прошивке, как на панели.</p>
     </section>
     <section class="card">
-      <h2>Knob</h2>
+      <h2>Энкодер</h2>
       <div class="knobrow">
-        <button id="ccw" type="button" aria-label="Turn left">⟲</button>
-        <div class="knob" id="knob" role="button" tabindex="0" aria-label="Knob: drag or scroll to turn, click to press"></div>
-        <button id="cw" type="button" aria-label="Turn right">⟳</button>
+        <button id="ccw" type="button" aria-label="Повернуть влево">⟲</button>
+        <div class="knob" id="knob" role="button" tabindex="0" aria-label="Ручка: крутите колёсиком или тяните, щелчок — нажатие"></div>
+        <button id="cw" type="button" aria-label="Повернуть вправо">⟳</button>
       </div>
-      <p class="hint">Scroll or drag to turn a detent at a time; click to press, hold for a long press.</p>
+      <p class="hint">Колёсико мыши или перетаскивание — по одному щелчку; клик — нажатие, удержание — долгое нажатие.</p>
       <div class="board-keys">
-        <button id="boot" type="button" title="GPIO0 low while held, as the board's BOOT key">BOOT</button>
-        <button id="rst" type="button" title="The board's RESET key: the chip restarts, the flash keeps everything">RESET</button>
+        <button id="boot" type="button" title="Пока нажата, GPIO0 в нуле — как кнопка BOOT на плате">BOOT</button>
+        <button id="rst" type="button" title="Кнопка RESET платы: чип перезапускается, флэш всё помнит">RESET</button>
       </div>
     </section>
     <section class="card">
-      <h2>Room · SHTC3</h2>
+      <h2>Комната · SHTC3</h2>
       <div class="look" style="gap:12px">
         <label>°C <input id="tC" type="range" min="10" max="35" step="0.5" value="22.5"><b id="tCv">22.5</b></label>
         <label>%RH <input id="rh" type="range" min="10" max="90" step="1" value="45"><b id="rhv">45</b></label>
       </div>
-      <p class="hint">The air at the board's sensor (I2C0 0x70). The firmware reads it for the weather clock and smooths it over a minute.</p>
+      <p class="hint">Воздух у датчика платы (I2C0 0x70). Прошивка читает его для часов с погодой и сглаживает за минуту.</p>
     </section>
     <section class="card">
-      <h2>Console · USB</h2>
+      <h2>Консоль · USB</h2>
       <pre id="console"></pre>
-      <form class="line" id="line"><input id="lineIn" placeholder="ir help" autocomplete="off"><button type="submit">Send</button></form>
+      <form class="line" id="line"><input id="lineIn" placeholder="ir help" autocomplete="off"><button type="submit">Отправить</button></form>
       <p class="hint" id="portal"></p>
     </section>
   </aside>
@@ -214,18 +214,18 @@
     conBuf += s; if (conBuf.length > 60000) conBuf = conBuf.slice(-40000);
     const atEnd = con.scrollTop + con.clientHeight >= con.scrollHeight - 4;
     con.textContent = conBuf; if (atEnd) con.scrollTop = con.scrollHeight;
-    const m = /IP Address: ([0-9.]+)/.exec(s); if (m) $('portal').innerHTML = `The firmware got ${m[1]} on the virtual Wi-Fi; its portal is forwarded to <a href="http://127.0.0.1:8080/" target="_blank" rel="noopener">127.0.0.1:8080</a>.`;
+    const m = /IP Address: ([0-9.]+)/.exec(s); if (m) $('portal').innerHTML = `Прошивка получила адрес ${m[1]} в виртуальной Wi-Fi; её портал проброшен на <a href="http://127.0.0.1:8080/" target="_blank" rel="noopener">127.0.0.1:8080</a>.`;
   }
   function connect() {
     ws = new WebSocket(`ws://${location.host}/ws`); ws.binaryType = 'arraybuffer';
-    ws.onopen = () => { $('conn').classList.add('on'); $('connText').textContent = 'running'; };
-    ws.onclose = () => { $('conn').classList.remove('on'); $('connText').textContent = 'stopped'; setTimeout(connect, 1500); };
+    ws.onopen = () => { $('conn').classList.add('on'); $('connText').textContent = 'работает'; };
+    ws.onclose = () => { $('conn').classList.remove('on'); $('connText').textContent = 'остановлен'; setTimeout(connect, 1500); };
     ws.onmessage = (ev) => {
       if (typeof ev.data === 'string') {
         let m; try { m = JSON.parse(ev.data); } catch { return; }
         if (m.t === 'serial' && m.src === 'usb') appendConsole(m.data);
-        else if (m.t === 'board') $('board').textContent = 'board ' + m.name;
-        else if (m.t === 'stat') { $('stTime').textContent = m.time.toFixed(1) + ' s'; $('stBehind').textContent = (m.behind * 1000).toFixed(0) + ' ms'; }
+        else if (m.t === 'board') $('board').textContent = 'плата ' + m.name;
+        else if (m.t === 'stat') { $('stTime').textContent = m.time.toFixed(1) + ' с'; $('stBehind').textContent = (m.behind * 1000).toFixed(0) + ' мс'; }
         return;
       }
       const b = new DataView(ev.data);
@@ -243,21 +243,21 @@
 
   // ---- the remote: the owner's ten learned buttons (ir_map.h slots 1..10, functions as bound on the panel)
   const BUTTONS = [
-    { n: 5, label: 'Power', fn: 'power', code: 0xFF28D7, cls: 'accent' },
-    { n: 8, label: 'Home', fn: 'home', code: 0xFF12ED },
-    { n: 7, label: 'Carousel', fn: 'carousel', code: 0xFF19E6 },
+    { n: 5, label: 'Питание', fn: 'power', code: 0xFF28D7, cls: 'accent' },
+    { n: 8, label: 'Домой', fn: 'home', code: 0xFF12ED },
+    { n: 7, label: 'Карусель', fn: 'carousel', code: 0xFF19E6 },
     { n: 1, label: '◀', fn: 'ccw', code: 0xFF708F, cls: 'round' },
     { n: 3, label: 'OK', fn: 'ok', code: 0xFFE01F, cls: 'round accent' },
     { n: 2, label: '▶', fn: 'cw', code: 0xFF58A7, cls: 'round' },
-    { n: 9, label: 'Bright −', fn: 'bright_down', code: 0xFF40BF },
-    { n: 4, label: 'Long', fn: 'long', code: 0xFF41BE },
-    { n: 6, label: 'Bright +', fn: 'bright_up', code: 0xFFC03F },
-    { n: 10, label: 'Play/Pause', fn: 'media_toggle', code: 0xFFC936 },
+    { n: 9, label: 'Ярче −', fn: 'bright_down', code: 0xFF40BF },
+    { n: 4, label: 'Долгое', fn: 'long', code: 0xFF41BE },
+    { n: 6, label: 'Ярче +', fn: 'bright_up', code: 0xFFC03F },
+    { n: 10, label: 'Пуск/пауза', fn: 'media_toggle', code: 0xFFC936 },
   ];
   const remote = $('remote');
   for (const b of BUTTONS) {
     const el = document.createElement('button'); el.type = 'button'; if (b.cls) el.className = b.cls;
-    el.innerHTML = `${b.label}<small>${b.n}</small>`; el.title = `button ${b.n}, NEC 0x${b.code.toString(16).toUpperCase()}`;
+    el.innerHTML = `${b.label}<small>${b.n}</small>`; el.title = `кнопка ${b.n}, NEC 0x${b.code.toString(16).toUpperCase()}`;
     if (b.n === 10) el.style.gridColumn = '2';
     let t0 = 0;
     // `ir down <code>` starts the NEC message and its repeats; `ir up` stops them (panel_inputs.rs)
