@@ -105,12 +105,14 @@ its source).
 | TSOP2138 IR receiver + the owner's NEC remote | GPIO0, open drain, active low | NEC messages from IRremoteESP8266's `ir_NEC.h` (8960/4480 header, 560 marks, 1680/560 spaces, 32 bits MSB first, every message padded to 108,080 us; a held key sends 8960/2240/560 repeats each slot); the ten learned codes by function name, number or raw `0x` code; optional receiver delay and mark stretch (Vishay 82460 bounds 105–263 us, −79..+92 us) |
 | EC11 knob A / B | IO45 / IO46, active high (idle low, 10 k pull-downs) | quadrature at 3 ms a state, 12 ms between clicks; full-cycle or half-cycle detents |
 | Knob switch, BOOT | GPIO0, active low | timed or held presses |
+| Sensirion SHTC3 | I2C0 (SDA 47, SCL 48) at 0x70 | `esp32s3/src/i2c/shtc3.rs`, from the datasheet (Version 4, December 2022; each number names its table): wake-up, sleep, soft reset, read ID (0x0807), the eight measurement commands, words with their CRC-8, NACK while asleep (only the wake-up gets in) and while measuring without clock stretching; Table 5's max times on the board's cycle. The air starts at 22.5 °C, 45 %RH |
 
 GPIO0 is the wired-AND of the receiver, the switch and BOOT. Script verbs (also the page's
 `{"t":"input","line":...}` message): `ir <key> [hold <ms>]`, `ir down <key>` / `ir up`,
 `ir tsop <delay_us> <stretch_us>`, `knob cw|ccw [n]`, `knob detent full|half`,
 `knob timing <state_ms> <gap_ms>`, `sw [ms]|down|up`, `boot [ms]|down|up`, and `press`/`release`
-of `sw`, `knob`, `boot`. `press 0` is refused; `gpio 0 <level>` still writes the pin raw until the
+of `sw`, `knob`, `boot`; `climate <°C> <%RH>` sets the air at the SHTC3 from its next measurement
+(-40..125 °C, 0..100 %RH, datasheet Tables 1-2). `press 0` is refused; `gpio 0 <level>` still writes the pin raw until the
 next device edge. BOOT held through a reset does not select download mode here: the strap
 register is `--strap`. `tools/panel-inputs-oracle/` replays a run's `--vcd` edges through the
 firmware's own decoder sources built on the host (IRremoteESP8266 `decode()`, `ir_map.h`,
