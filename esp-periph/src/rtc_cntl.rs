@@ -6,9 +6,15 @@ use emu_core::ClockDomain;
 /// Reset causes (RTC_CNTL_RESET_CAUSE_PROCPU), as the ROM prints them.
 pub const RST_POWERON: u32 = 1; pub const RST_SW_SYS: u32 = 3; pub const RST_RTCWDT_SYS: u32 = 9; pub const RST_SW_CPU: u32 = 12;
 pub const RST_RTCWDT_CPU: u32 = 13; pub const RST_RTCWDT_RTC: u32 = 16;
+/// The USB host reset the chip through the USB-Serial/JTAG's CDC-ACM lines (RTS=1, DTR=0) or its
+/// JTAG interface. Both are Core Resets (ESP32-S3 TRM v1.8 Table 7.1-1, p.528: 0x15 "USB (UART)
+/// reset", 0x16 "USB (JTAG) reset"); the names are the ROM's (IDF 5.5.4
+/// esp_rom/esp32s3/include/esp32s3/rom/rtc.h:90-91, soc/esp32s3/include/soc/reset_reasons.h:59-60).
+pub const RST_USB_UART_CHIP: u32 = 0x15; pub const RST_USB_JTAG_CHIP: u32 = 0x16;
 pub fn reset_cause_name(c: u32) -> &'static str {
     match c { 1 => "POWERON", 3 => "RTC_SW_SYS_RESET", 5 => "DEEPSLEEP", 7 => "TG0WDT_SYS_RESET", 8 => "TG1WDT_SYS_RESET", 9 => "RTCWDT_SYS_RESET", 11 => "TG0WDT_CPU_RESET",
-            12 => "RTC_SW_CPU_RESET", 13 => "RTCWDT_CPU_RESET", 15 => "RTCWDT_BROWN_OUT_RESET", 16 => "RTCWDT_RTC_RESET", 17 => "TG1WDT_CPU_RESET", 18 => "SUPER_WDT_RESET", _ => "?" }
+            12 => "RTC_SW_CPU_RESET", 13 => "RTCWDT_CPU_RESET", 15 => "RTCWDT_BROWN_OUT_RESET", 16 => "RTCWDT_RTC_RESET", 17 => "TG1WDT_CPU_RESET", 18 => "SUPER_WDT_RESET",
+            0x15 => "USB_UART_CHIP_RESET", 0x16 => "USB_JTAG_CHIP_RESET", _ => "?" }
 }
 
 /// RTC_CNTL: reset control, slow-clock time and the RTC watchdog.

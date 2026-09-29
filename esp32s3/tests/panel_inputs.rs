@@ -126,7 +126,7 @@ fn boot_held_through_a_power_on_reset_latches_download_mode() {
         m.cores[0].pc = IRAM; m.cores[0].ps = 0;             // back to the sleeping loop (SRAM survives)
         m.bus.periph.gpio.strap
     };
-    m.bus.periph.gpio.strap = 0x2f;                         // --strap: bit 5 is not the board's
+    m.bus.set_strap(0x2f);                                  // --strap: bit 5 is not the board's
     hold(&mut m, "boot", "down");
     assert!(!bit(&m, PIN_GPIO0));
     let strap = reset(&mut m, esp_periph::RST_SW_SYS);

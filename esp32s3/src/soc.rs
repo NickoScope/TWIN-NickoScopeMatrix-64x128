@@ -126,7 +126,6 @@ impl esp_soc::SocBus for SocBus {
         let old = std::mem::replace(&mut self.periph, periph::Peripherals::new(mac));
         let p = &mut self.periph;
         p.efuse = old.efuse;
-        p.gpio.strap = old.gpio.strap;
         p.misc.log_unknown = old.misc.log_unknown; p.spi1.log = old.spi1.log;
         p.spi0.jedec = old.spi0.jedec; p.spi1.jedec = old.spi1.jedec;   // the flash chip is not reset: its ID keeps the --flash-mb capacity
         p.rtc.ram = old.rtc.ram; p.rtc.slow_ticks = old.rtc.slow_ticks;
@@ -150,12 +149,34 @@ impl esp_soc::SocBus for SocBus {
         // the boot-mode bits the board drives change: GPIO_STRAPPING[3] = GPIO0, [2] = GPIO46 (IDF
         // 5.5.4 soc/esp32s3/include/soc/boot_mode.h: IS_1XXX SPI boot, IS_00XX joint download).
         // The other bits stay `--strap`, and a board without input levels keeps them all.
-        if cause == esp_periph::RST_POWERON {
-            for (pin, level) in self.board.input_levels() {
-                let bit = match pin { 0 => 3, 46 => 2, _ => continue };
-                if level { self.periph.gpio.strap |= 1 << bit } else { self.periph.gpio.strap &= !(1 << bit) }
+        //
+        // A USB-Serial/JTAG reset (0x15) is a Core Reset (Table 7.1-1), so it samples nothing; the
+        // host's download mode flag, taken when RTS=1/DTR=0 began (`esp_periph::UsjLines`), picks
+        // the boot instead (Table 33.3-2, p.1248: "if the download mode flag is set when the
+        // ESP32-S3 is reset, the ESP32-S3 will reboot into download mode"). The model clears
+        // GPIO_STRAPPING[3:2], joint download (boot_mode.h IS_00XX), for that one boot, the effect
+        // TRM §8.2 (p.536) documents for RTC_CNTL_FORCE_DOWNLOAD_BOOT; which register the USB
+        // controller drives on silicon, and what GPIO_STRAPPING reads then, is not verified. Without
+        // the flag the reset boots with the latched pins: after BOOT held through power-on it stays
+        // in download mode, as esptool's docs say a USB reset cannot leave a strapped download mode
+        // ("Leaving Download Mode in USB-Serial/JTAG Mode", esp32s3). Any other reset keeps the
+        // register as it was. A power-on reset also resets the USB device: the lines start over.
+        let strap = match cause {
+            esp_periph::RST_POWERON => {
+                let mut v = self.strap_latched;
+                for (pin, level) in self.board.input_levels() {
+                    let bit = match pin { 0 => 3, 46 => 2, _ => continue };
+                    if level { v |= 1 << bit } else { v &= !(1 << bit) }
+                }
+                self.strap_latched = v;
+                self.usj = Default::default();
+                v
             }
-        }
+            esp_periph::RST_USB_UART_CHIP if self.usj.latched_download => self.strap_latched & !0x0c,
+            esp_periph::RST_USB_UART_CHIP => self.strap_latched,
+            _ => old.gpio.strap,
+        };
+        self.periph.gpio.strap = strap;
         self.mmu = [MMU_INVALID; MMU_ENTRIES];
         self.invalidate_tlb();
         self.reset_approximate_cache();
@@ -197,7 +218,11 @@ impl esp_soc::SocBus for SocBus {
         self.rebuild_page_table();
     }
     fn set_psram_size(&mut self, bytes: usize) -> Result<(), String> { self.psram = vec![0; bytes]; self.rebuild_page_table(); Ok(()) }
-    fn set_strap(&mut self, v: u32) { self.periph.gpio.strap = v; }
+    /// `--strap`: the pins as the next boot latches them (the run's first boot takes all of it).
+    fn set_strap(&mut self, v: u32) { self.periph.gpio.strap = v; self.strap_latched = v; }
+    fn strap(&self) -> Option<u32> { Some(self.periph.gpio.strap) }
+    fn usj_lines(&mut self, dtr: bool, rts: bool) -> esp_periph::LineEffect { self.usj.set(dtr, rts) }
+    fn usj_line_state(&self) -> Option<esp_periph::UsjLines> { Some(self.usj) }
     fn set_reset_cause(&mut self, c: u32) { self.periph.rtc.ram.write(0x38, c | (c << 6)); }
     fn report(&self) -> String {
         let p = &self.periph;

@@ -42,7 +42,8 @@ PSRAM and register presets.
 | `--script F` | host actions at emulated times (below) |
 | `--console usb\|uart0\|both\|all\|none`, `--console-prefix` | which consoles to print |
 | `--realtime` | pace to wall time without the UI |
-| `--web PORT [--web-dir DIR]` | browser UI (implies real time) |
+| `--web PORT [--web-dir DIR]` | browser UI (implies real time); also the USB-Serial/JTAG as a serial port at `ws://127.0.0.1:PORT/usj` (protocol in `esp-soc/src/web.rs`) |
+| `--serial-tcp PORT` | the USB-Serial/JTAG as an RFC 2217 port on 127.0.0.1:PORT for pyserial tools: `esptool --port rfc2217://127.0.0.1:PORT --before usb_reset …`. Data both ways without loss; DTR/RTS reset the chip as the controller does (ESP32-S3 TRM Table 33.3-2: RTS=1/DTR=0 resets and holds it, the download flag set by RTS=0/DTR=1 picks download mode, cause 0x15), with `--boot rom` and reboots allowed; a run without them carries data only. One client at a time holds the port, over this and `/usj` together; while one does, the USB console goes to it and not to stdout or the page |
 | `--cam-image F`, `--cam-fps N` | camera source for boards with a camera |
 | `--cooja` (C6) | run as a Cooja-NG external mote: the lock-step NDJSON protocol on stdin/stdout, the guest console as `log` events, the 802.15.4 frames as `tx`/`rx`. Honors `--no-reboot` and `--max-seconds` (see [esp32c6.md](esp32c6.md), "Cooja-NG lock-step") |
 | `--cooja-slice-us N` | how long a busy guest runs before asking csim to step it again (default 100; `hello.args.slice_us` overrides). A transmission reaches csim's medium at the end of the slice it started in, so this bounds how late it is |
@@ -97,6 +98,8 @@ One action per line, `<seconds> <cmd> [args]`; buttons/encoder are active low.
 4.0  serial {"action":"set_note","value":"5"}
 4.2  uart0 root              # a line into UART0's receive FIFO (also `uart1`): a login on a Linux console
 4.5  touch 450 30 1        # touch panel press at (450,30); `touch x y 0` releases
+5.0  usj 1 0               # the USB host's lines on the USB-Serial/JTAG: DTR=1 RTS=0 (sets the download flag)
+5.1  usjhex c0000800...c0  # raw bytes from the USB host into the USB-Serial/JTAG
 5.5  stop
 ```
 

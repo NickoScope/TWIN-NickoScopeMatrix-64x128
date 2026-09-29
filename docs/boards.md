@@ -118,7 +118,10 @@ Reset) latches GPIO0 = 0 with IO46 = 0 into `GPIO_STRAPPING[3:2]`, so the ROM st
 download mode as the board does; released, the next RESET boots from flash. Software and
 watchdog resets keep the latch (only a Chip Reset samples the pins, ESP32-S3 TRM §8.1 and Table
 7.1-1), the other strap bits stay `--strap`, and the run's first boot takes the whole strap from
-`--strap`. `tools/panel-inputs-oracle/` replays a run's `--vcd` edges through the
+`--strap`. A USB-Serial/JTAG reset from the host's lines (RTS=1/DTR=0 at `/usj` or `--serial-tcp`,
+cause 0x15, TRM Table 33.3-2) is a Core Reset too: with the download flag set it clears
+`GPIO_STRAPPING[3:2]` for that one boot (joint download), without it the chip boots with the
+latched pins — after BOOT held through power-on that is still download mode. `tools/panel-inputs-oracle/` replays a run's `--vcd` edges through the
 firmware's own decoder sources built on the host (IRremoteESP8266 `decode()`, `ir_map.h`,
 `control.cpp`).
 

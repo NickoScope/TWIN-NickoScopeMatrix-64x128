@@ -73,6 +73,8 @@ pub struct Opts {
     pub spi2_timing: bool, pub measured_te: bool,
     pub max_insns: u64, pub max_seconds: Option<f64>, pub script: Option<String>, pub serial: Option<String>,
     pub console: Option<String>, pub console_prefix: bool, pub realtime: bool, pub web_port: Option<u16>, pub web_dir: Option<String>, pub no_reboot: bool,
+    /// `--serial-tcp PORT`: the USB-Serial/JTAG as an RFC 2217 port on 127.0.0.1:PORT
+    pub serial_tcp: Option<u16>,
     pub wav: Option<String>, pub tft_png: Option<String>, pub gram_png: Option<String>, pub dump: bool,
     pub trace: bool, pub trace_from: u64, pub breaks: Vec<u32>, pub watch: Option<u32>, pub peeks: Vec<(u32, usize)>, pub disasms: Vec<(u32, usize)>,
     pub profile: bool, pub profile_blocks: bool, pub coverage: Option<Option<String>>, pub irq_latency: bool, pub vcd: Option<String>,
@@ -141,6 +143,9 @@ pub fn parse(args: &[String], default_chip: &str) -> Opts {
             "--realtime" => o.realtime = true,
             "--web" => o.web_port = Some(next().parse().expect("port")),
             "--web-dir" => o.web_dir = Some(next()),
+            // The USB-Serial/JTAG as a serial port for pyserial's rfc2217:// (esptool --port
+            // rfc2217://127.0.0.1:PORT): data, and DTR/RTS resets as the controller does them.
+            "--serial-tcp" => o.serial_tcp = Some(next().parse().unwrap_or_else(|_| usage_error("--serial-tcp: a TCP port number"))),
             "--no-reboot" => o.no_reboot = true,
             "--wav" => o.wav = Some(next()),
             "--tft-png" => o.tft_png = Some(next()),
@@ -374,6 +379,9 @@ fn run<S: Soc>(mut m: Machine<S>, o: &Opts) {
     let boot = prepare(&mut m, o);
     let t0 = std::time::Instant::now();
     m.web_restart = !o.no_reboot;
+    // The host's RTS=1/DTR=0 resets the chip only where the run comes back up through the ROM.
+    m.usj_reset = !o.no_reboot && boot == "rom";
+    if m.usj.is_some() && !m.usj_reset { eprintln!("[emu] USB-Serial/JTAG line resets are ignored in this run (--boot app or --no-reboot): data only"); }
     let stop = run_with_reboots(&mut m, o.max_insns, !o.no_reboot && boot == "rom", boot == "app");
     let dt = t0.elapsed().as_secs_f64();
     report(&mut m, o, stop, dt);
@@ -477,6 +485,18 @@ fn prepare<S: Soc>(m: &mut Machine<S>, o: &Opts) -> String {
         let w = esp_soc::web::WebServer::start(port, dir.clone()).expect("web server");
         eprintln!("[emu] board UI: http://127.0.0.1:{}/  (serving {})", port, dir);
         m.web = Some(w); m.rt.enabled = true;
+    }
+    // One USB-Serial/JTAG host end for both front ends: one client at a time holds it.
+    if o.web_port.is_some() || o.serial_tcp.is_some() {
+        let port = esp_soc::usj_port::UsjPort::new();
+        if let Some(w) = &m.web { w.attach_usj(port.clone()); eprintln!("[emu] USB-Serial/JTAG port: ws://127.0.0.1:{}/usj", w.port); }
+        if let Some(tcp) = o.serial_tcp {
+            match esp_soc::rfc2217::start(tcp, port.clone()) {
+                Ok(p) => eprintln!("[emu] USB-Serial/JTAG port: rfc2217://127.0.0.1:{p}"),
+                Err(e) => usage_error(&format!("--serial-tcp {tcp}: cannot listen on 127.0.0.1:{tcp}: {e}")),
+            }
+        }
+        m.attach_usj(port);
     }
     if o.realtime { m.rt.enabled = true; }
     if o.profile { m.add_observer(Box::new(PcHist::new(12))); }

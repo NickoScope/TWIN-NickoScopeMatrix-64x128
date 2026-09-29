@@ -19,7 +19,9 @@ pub mod observe;
 pub mod observers;
 pub mod picture;
 pub mod png;
+pub mod rfc2217;
 pub mod soc;
+pub mod usj_port;
 pub mod web;
 pub mod wifi;
 

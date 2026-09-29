@@ -111,6 +111,28 @@ fn hello_world_s3_reboot() {
     expect_u64("hello-s3-reboot.insns", r.insns);
 }
 
+/// The USB host at the USB-Serial/JTAG: ESP32-S3 TRM v1.8 Table 33.4-3 (script `usj` lines)
+/// resets the chip with cause 0x15 into joint download mode, where the ROM answers a SYNC on the
+/// USB eight times; Table 33.4-4 then resets it into the app again. The chip stays in reset for
+/// the 100 ms the lines hold RTS=1/DTR=0.
+#[test] #[ignore = "needs the ESP32-S3 mask ROM ELF"]
+fn usj_lines_reset_into_download_mode_and_back() {
+    let rom = rom("esp32s3_rev0");
+    let script = tmp("usj-reset.script");
+    let sync = format!("c0000824000000000007071220{}c0", "55".repeat(32));
+    std::fs::write(&script, format!("0.30 usj 0 0\n0.31 usj 1 0\n0.32 usj 1 1\n0.33 usj 0 1\n0.43 usj 0 0\n0.60 usjhex {sync}\n0.80 usj 0 0\n0.81 usj 0 1\n0.91 usj 0 0\n")).unwrap();
+    let r = run(BIN, &["--rom", rom.to_str().unwrap(), "--board", "none", "--boot", "rom", "--no-dump", "--console", "both",
+        "--bootloader", &format!("{FW}/hello-bootloader.bin"), "--ptable", &format!("{FW}/hello-ptable.bin"), "--app", &format!("{FW}/hello_world.bin"),
+        "--script", script.to_str().unwrap(), "--max-seconds", "2"]);
+    assert!(r.stderr.contains("[emu] usj: t=0.330s RTS=1 DTR=0 -> chip reset 0x15 (USB_UART_CHIP_RESET), download mode flag 1"), "{}", r.stderr);
+    assert!(r.stderr.contains("[emu] usj: t=0.430s RTS=0 DTR=0 -> out of reset, GPIO_STRAPPING 0x3 (download)"), "{}", r.stderr);
+    let dl = r.stdout.find("rst:0x15 (USB_UART_CHIP_RESET),boot:0x3 (DOWNLOAD(USB/UART0))").unwrap_or_else(|| panic!("no download boot:\n{}", r.stdout));
+    let wait = r.stdout[dl..].find("waiting for download").expect("the ROM waits for a host");
+    assert_eq!(r.stdout[dl + wait..].matches("\x01\x08\x04\x00\x07\x07\x12\x20").count(), 8, "eight SYNC answers");
+    let back = r.stdout[dl..].find("rst:0x15 (USB_UART_CHIP_RESET),boot:0xf (SPI_FAST_FLASH_BOOT)").expect("Table 33.4-4 boots from flash");
+    assert!(r.stdout[dl + back..].contains("Hello world!"), "the app runs again:\n{}", &r.stdout[dl + back..]);
+}
+
 /// The block profile attributes time to symbols (the ROM's here), and the per-instruction
 /// `--profile` (slow path, idle cores stepping) still agrees on the hottest function.
 #[test] #[ignore = "needs the ESP32-S3 mask ROM ELF"]

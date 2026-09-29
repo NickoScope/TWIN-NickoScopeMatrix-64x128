@@ -1,5 +1,37 @@
 //! Minimal HTTP + WebSocket (RFC 6455) server for the board UI — no external crates.
-//! Text frames carry JSON; binary frames carry TFT frames (type 1) and audio (type 2).
+//!
+//! Two WebSocket endpoints, chosen by the path of the upgrade request:
+//!
+//! `/ws` (any path but `/usj`): the board UI. Text frames carry JSON both ways; binary frames from
+//! the machine carry pictures (type 1 RGB565, 5 linear light, 4 camera preview) and audio (type 2),
+//! from the page camera pictures (type 3). This is a view: under load a client's live frames may be
+//! dropped (a bounded queue), and at most 4 binary inputs wait at a time.
+//!
+//! `/usj`: the USB-Serial/JTAG as a serial port (`usj_port`), for the browser flasher's
+//! `navigator.serial` stand-in. Binary frames only; the first byte is the type. Nothing on this
+//! endpoint is dropped or bounded in either direction, and bytes are never re-encoded.
+//!
+//! | direction | frame | meaning |
+//! |---|---|---|
+//! | page -> engine | `0x00` + bytes | data for the controller's receive side (USB OUT), cut into 64-byte packets there |
+//! | page -> engine | `0x01` + `b` | the full line state after one change: bit 0 DTR, bit 1 RTS (1 = asserted) |
+//! | page -> engine | `0x02` | open: claim the port for this connection |
+//! | page -> engine | `0x03` | close: let it go (the engine then applies DTR = RTS = 0) |
+//! | engine -> page | `0x00` + bytes | the controller's transmit side (USB IN), exactly as sent |
+//! | engine -> page | `0x10` + JSON (UTF-8) | an event, below |
+//!
+//! Events: `{"t":"hello","proto":1,"chip":"esp32s3","dtr":0,"rts":0,"held":false,"reset":true}`
+//! once the machine has taken this connection's open (the port is open from here on; `reset`
+//! false means line resets are ignored by this run); `{"t":"error","error":"busy"}` when another
+//! client holds the port (the port stays closed for this connection); `{"t":"error","error":
+//! "not open"}` for data or lines before an open; `{"t":"closed"}` after a close;
+//! `{"t":"reset","cause":21,"download":true}` when RTS=1/DTR=0 begins (the chip is reset and held;
+//! `download` is the latched flag); `{"t":"release","strap":3}` when the pair leaves (1,0) (the
+//! chip runs; `strap` is GPIO_STRAPPING as its ROM reads it). Data and line frames are applied
+//! in the order they were sent. Text frames and unknown types are ignored (unknown types are logged
+//! once per connection). Output reaches the connection only while it holds the port; the rest of
+//! the time the USB console goes to `/ws` and stdout as before. Closing the WebSocket closes the port.
+use crate::usj_port::{Busy, PortOut, Session, UsjPort};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -27,6 +59,8 @@ pub struct Shared {
     pub incoming_bin: VecDeque<Vec<u8>>,
     pub web_dir: String,
     pub hello: Vec<Vec<u8>>,     // frames sent to every new client (board description etc.)
+    /// the port behind `/usj`; without one that path answers 404
+    pub usj: Option<UsjPort>,
 }
 
 #[derive(Clone)]
@@ -78,7 +112,7 @@ impl WebServer {
     pub fn start(port: u16, web_dir: String) -> std::io::Result<WebServer> {
         let listener = TcpListener::bind(("127.0.0.1", port))?;
         let port = listener.local_addr()?.port();
-        let shared = Arc::new(Mutex::new(Shared { queue: false, outbox: VecDeque::new(), clients: Vec::new(), incoming: VecDeque::new(), incoming_bin: VecDeque::new(), web_dir, hello: Vec::new() }));
+        let shared = Arc::new(Mutex::new(Shared { queue: false, outbox: VecDeque::new(), clients: Vec::new(), incoming: VecDeque::new(), incoming_bin: VecDeque::new(), web_dir, hello: Vec::new(), usj: None }));
         let s2 = shared.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
@@ -91,7 +125,7 @@ impl WebServer {
     /// A server with no sockets: everything sent is queued for whoever drains `take_outbox`
     /// (the wasm glue), and input arrives through `push_incoming*`. Same protocol, no transport.
     pub fn queued() -> WebServer {
-        WebServer { shared: Arc::new(Mutex::new(Shared { queue: true, outbox: VecDeque::new(), clients: Vec::new(), incoming: VecDeque::new(), incoming_bin: VecDeque::new(), web_dir: String::new(), hello: Vec::new() })), port: 0 }
+        WebServer { shared: Arc::new(Mutex::new(Shared { queue: true, outbox: VecDeque::new(), clients: Vec::new(), incoming: VecDeque::new(), incoming_bin: VecDeque::new(), web_dir: String::new(), hello: Vec::new(), usj: None })), port: 0 }
     }
     pub fn send_text(&self, s: &str) { self.emit(1, s.as_bytes()); }
     pub fn send_binary(&self, d: &[u8]) { self.emit(2, d); }
@@ -114,6 +148,8 @@ impl WebServer {
     pub fn poll_incoming(&self) -> Vec<String> { let mut sh = self.shared.lock().unwrap(); sh.incoming.drain(..).collect() }
     pub fn poll_incoming_bin(&self) -> Vec<Vec<u8>> { let mut sh = self.shared.lock().unwrap(); sh.incoming_bin.drain(..).collect() }
     pub fn clients(&self) -> usize { self.shared.lock().unwrap().clients.len() }
+    /// Serve `port` at `/usj`.
+    pub fn attach_usj(&self, port: UsjPort) { self.shared.lock().unwrap().usj = Some(port); }
 }
 
 /// The value of HTTP header `name` in a request head. Header names are case-insensitive
@@ -192,10 +228,17 @@ fn handle_client(mut stream: TcpStream, shared: Arc<Mutex<Shared>>) {
         let _ = http_response(&mut stream, "403 Forbidden", "text/plain", b"foreign Origin denied");
         return;
     }
+    let path = text.split_whitespace().nth(1).unwrap_or("/").split('?').next().unwrap_or("/");
+    let usj = if path == "/usj" {
+        let port = shared.lock().unwrap().usj.clone();
+        let Some(port) = port else { let _ = http_response(&mut stream, "404 Not Found", "text/plain", b"no USB-Serial/JTAG port in this run"); return; };
+        Some(port)
+    } else { None };
     let Ok(mut out) = stream.try_clone() else { return; };
     let accept = b64(&sha1(format!("{}258EAFA5-E914-47DA-95CA-C5AB0DC85B11", key).as_bytes()));
     if write!(stream, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").is_err() { return; }
     let _ = stream.set_nodelay(true);
+    if let Some(port) = usj { return handle_usj(stream, out, req[head_end..].to_vec(), port); }
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(256);
     let hello = {
         let mut sh = shared.lock().unwrap();
@@ -210,28 +253,97 @@ fn handle_client(mut stream: TcpStream, shared: Arc<Mutex<Shared>>) {
     });
     // read loop
     // A TCP read may have included the first frame after the HTTP head.
-    let mut input = req[head_end..].chain(&mut stream);
-    let mut read_exact = |n: usize| -> Option<Vec<u8>> { let mut v = vec![0u8; n]; input.read_exact(&mut v).ok()?; Some(v) };
-    while let Some(h) = read_exact(2) {
-        let op = h[0] & 0xf; let masked = h[1] & 0x80 != 0; let mut len = (h[1] & 0x7f) as u64;
-        if op >= 8 && (h[0] & 0x80 == 0 || len > 125) { break; }
-        if len == 126 { let Some(e) = read_exact(2) else { break }; len = u16::from_be_bytes([e[0], e[1]]) as u64; }
-        else if len == 127 { let Some(e) = read_exact(8) else { break }; len = u64::from_be_bytes(e.try_into().unwrap()); }
-        let mask = if masked { let Some(m) = read_exact(4) else { break }; m } else { vec![0; 4] };
-        if len > 8 << 20 { break; }
-        let Some(mut data) = read_exact(len as usize) else { break };
-        if masked { for (i, b) in data.iter_mut().enumerate() { *b ^= mask[i & 3]; } }
+    read_frames(req[head_end..].chain(&mut stream), |op, data| {
         match op {
-            8 => break,
-            9 => { if tx.send(frame(10, &data)).is_err() { break; } }
+            9 => return tx.send(frame(10, &data)).is_ok(),
             1 => { shared.lock().unwrap().incoming.push_back(String::from_utf8_lossy(&data).to_string()); }
             2 => { let mut sh = shared.lock().unwrap(); if sh.incoming_bin.len() < 4 { sh.incoming_bin.push_back(data); } }
             _ => {}
         }
-    }
+        true
+    });
     let mut sh = shared.lock().unwrap();
     let me = stream.peer_addr().ok();
     sh.clients.retain(|c| c.peer != me);
+}
+
+/// Read client frames (RFC 6455 §5.2) until the connection ends, a close frame (opcode 8)
+/// arrives or `on(opcode, payload)` returns false. Payloads are unmasked; a fragmented message
+/// (§5.4) is delivered once, whole, with its first frame's opcode, and control frames may come
+/// between its fragments. A control frame that is fragmented or over 125 bytes, a frame or
+/// message over 8 MiB, or a continuation with nothing to continue ends the connection.
+fn read_frames(mut input: impl Read, mut on: impl FnMut(u8, Vec<u8>) -> bool) -> Option<u8> {
+    const MAX: u64 = 8 << 20;
+    let mut read_exact = |n: usize| -> Option<Vec<u8>> { let mut v = vec![0u8; n]; input.read_exact(&mut v).ok()?; Some(v) };
+    let mut partial: Option<(u8, Vec<u8>)> = None;
+    while let Some(h) = read_exact(2) {
+        let fin = h[0] & 0x80 != 0; let op = h[0] & 0xf; let masked = h[1] & 0x80 != 0; let mut len = (h[1] & 0x7f) as u64;
+        if op >= 8 && (!fin || len > 125) { break; }
+        if len == 126 { let Some(e) = read_exact(2) else { break }; len = u16::from_be_bytes([e[0], e[1]]) as u64; }
+        else if len == 127 { let Some(e) = read_exact(8) else { break }; len = u64::from_be_bytes(e.try_into().unwrap()); }
+        let mask = if masked { let Some(m) = read_exact(4) else { break }; m } else { vec![0; 4] };
+        if len > MAX { break; }
+        let Some(mut data) = read_exact(len as usize) else { break };
+        if masked { for (i, b) in data.iter_mut().enumerate() { *b ^= mask[i & 3]; } }
+        if op == 8 { return Some(8); }
+        let (op, data) = match (op, partial.take()) {
+            (0, Some((first, mut acc))) => {
+                if acc.len() as u64 + len > MAX { break; }
+                acc.extend_from_slice(&data);
+                if !fin { partial = Some((first, acc)); continue; }
+                (first, acc)
+            }
+            (0, None) => break,
+            (op, held) if op < 8 && !fin => { if held.is_some() { break; } partial = Some((op, data)); continue; }
+            (op, held) => { partial = held; (op, data) }
+        };
+        if !on(op, data) { break; }
+    }
+    None
+}
+
+/// `/usj`: one connection of the serial-port protocol in the module header.
+fn handle_usj(stream: TcpStream, mut out: TcpStream, early: Vec<u8>, port: UsjPort) {
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let writer = std::thread::spawn(move || { for f in rx { if out.write_all(&f).is_err() { break; } } });
+    let event = |tx: &std::sync::mpsc::Sender<Vec<u8>>, json: &str| { let mut v = vec![0x10]; v.extend_from_slice(json.as_bytes()); let _ = tx.send(frame(2, &v)); };
+    let mut session: Option<Session> = None;
+    let mut unknown_logged = false;
+    let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+    let closing = read_frames(early.as_slice().chain(&stream), |op, data| {
+        match op {
+            9 => return tx.send(frame(10, &data)).is_ok(),
+            2 => match (data.first().copied(), &session) {
+                (Some(0x00), Some(s)) => s.data(data[1..].to_vec()),
+                (Some(0x01), Some(s)) => if let Some(&b) = data.get(1) { s.lines(b & 1 != 0, b & 2 != 0) },
+                (Some(0x00 | 0x01), None) => event(&tx, "{\"t\":\"error\",\"error\":\"not open\"}"),
+                (Some(0x02), Some(_)) => {}
+                (Some(0x02), None) => {
+                    let sink_tx = tx.clone();
+                    let sink = Box::new(move |o: PortOut| {
+                        let (kind, body) = match o { PortOut::Data(d) => (0x00u8, d), PortOut::Event(j) => (0x10, j.into_bytes()) };
+                        let mut v = Vec::with_capacity(body.len() + 1);
+                        v.push(kind);
+                        v.extend_from_slice(&body);
+                        sink_tx.send(frame(2, &v)).is_ok()
+                    });
+                    match port.open(sink) {
+                        Ok(s) => { eprintln!("[emu] usj: {peer} holds the USB-Serial/JTAG port (session {})", s.id()); session = Some(s); }
+                        Err(Busy) => event(&tx, "{\"t\":\"error\",\"error\":\"busy\"}"),
+                    }
+                }
+                (Some(0x03), _) => { if let Some(s) = session.take() { eprintln!("[emu] usj: session {} closed", s.id()); s.close(); } event(&tx, "{\"t\":\"closed\"}"); }
+                (t, _) => if !std::mem::replace(&mut unknown_logged, true) { eprintln!("[emu] usj: {peer}: unknown frame type {:?} ignored", t); },
+            },
+            _ => {}
+        }
+        true
+    });
+    if let Some(s) = session.take() { eprintln!("[emu] usj: {peer} went away; session {} closed", s.id()); s.close(); }
+    if closing.is_some() { let _ = tx.send(frame(8, &[0x03, 0xe8])); }    // answer a close with 1000 (RFC 6455 §5.5.1)
+    drop(tx);
+    let _ = writer.join();
+    let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
 /// Tiny JSON helpers for the few message shapes the UI sends.

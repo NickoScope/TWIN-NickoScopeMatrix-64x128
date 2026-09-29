@@ -230,3 +230,148 @@ fn websocket_origin_accepts_matching_forwarded_loopback_host() {
     }
     assert!(!local_origin("GET /ws HTTP/1.1\r\nHost: localhost:9000\r\nOrigin: http://localhost:9001\r\n\r\n", 8080));
 }
+
+// ---------------------------------------------------------------- /usj
+
+use crate::usj_port::{PortIn, PortOut, UsjPort};
+
+impl Connection {
+    fn upgrade(&mut self, path: &str) -> String {
+        write!(self.socket, "GET {path} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n").unwrap();
+        self.head()
+    }
+    /// One server frame: (opcode, payload); the server never masks.
+    fn read_frame(&mut self) -> (u8, Vec<u8>) {
+        let mut h = [0u8; 2];
+        self.socket.read_exact(&mut h).unwrap();
+        let mut len = (h[1] & 0x7f) as usize;
+        if len == 126 { let mut e = [0u8; 2]; self.socket.read_exact(&mut e).unwrap(); len = u16::from_be_bytes(e) as usize; }
+        else if len == 127 { let mut e = [0u8; 8]; self.socket.read_exact(&mut e).unwrap(); len = u64::from_be_bytes(e) as usize; }
+        let mut d = vec![0u8; len];
+        self.socket.read_exact(&mut d).unwrap();
+        (h[0] & 0x0f, d)
+    }
+}
+
+/// A client frame of any length, masked (RFC 6455 §5.3); `fin` false for a fragment.
+fn client_frame(opcode: u8, payload: &[u8], fin: bool) -> Vec<u8> {
+    let mask = [0x9a, 0x0b, 0xfe, 0x71];
+    let mut b = vec![(if fin { 0x80 } else { 0 }) | opcode];
+    let n = payload.len();
+    if n < 126 { b.push(0x80 | n as u8); } else if n < 65536 { b.push(0x80 | 126); b.extend_from_slice(&(n as u16).to_be_bytes()); } else { b.push(0x80 | 127); b.extend_from_slice(&(n as u64).to_be_bytes()); }
+    b.extend_from_slice(&mask);
+    b.extend(payload.iter().enumerate().map(|(i, x)| x ^ mask[i & 3]));
+    b
+}
+
+fn wait_for(port: &UsjPort, n: usize) -> Vec<PortIn> {
+    let mut got = Vec::new();
+    for _ in 0..500 { got.extend(port.poll()); if got.len() >= n { break; } std::thread::sleep(Duration::from_millis(10)); }
+    got
+}
+
+fn usj_web() -> (WebServer, UsjPort) {
+    let web = socket_web();
+    let port = UsjPort::new();
+    web.attach_usj(port.clone());
+    (web, port)
+}
+
+#[test]
+fn usj_is_lossless_both_ways_for_every_byte_value() {
+    let (web, port) = usj_web();
+    let mut c = Connection::new(&web);
+    assert!(c.upgrade("/usj").starts_with("HTTP/1.1 101"));
+    c.socket.write_all(&client_frame(2, &[0x02], true)).unwrap();
+    let open = wait_for(&port, 1);
+    let PortIn::Open(id) = open[0] else { panic!("{open:?}") };
+    // Host -> chip: 10,000 frames, every byte value, including 0x80..0xff that UTF-8 would mangle.
+    let mut want = Vec::new();
+    let mut wire = Vec::new();
+    for i in 0..10_000u32 {
+        let chunk: Vec<u8> = (0..(i % 70) as u8 + 1).map(|k| (i as u8).wrapping_mul(31).wrapping_add(k.wrapping_mul(97))).collect();
+        want.extend_from_slice(&chunk);
+        let mut f = vec![0x00];
+        f.extend_from_slice(&chunk);
+        wire.extend(client_frame(2, &f, true));
+    }
+    c.socket.write_all(&wire).unwrap();
+    let mut got = Vec::new();
+    for _ in 0..500 {
+        for e in port.poll() { match e { PortIn::Data(d) => got.extend(d), other => panic!("{other:?}") } }
+        if got.len() >= want.len() { break; }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(got.len(), want.len(), "nothing dropped");
+    assert_eq!(got, want);
+    // Chip -> host: 10,000 outputs, raw.
+    for i in 0..10_000u32 { assert!(port.deliver(id, PortOut::Data(vec![0xff, i as u8, 0x80, (i >> 8) as u8]))); }
+    for i in 0..10_000u32 {
+        let (op, d) = c.read_frame();
+        assert_eq!((op, d), (2, vec![0x00, 0xff, i as u8, 0x80, (i >> 8) as u8]), "frame {i}");
+    }
+    assert!(port.deliver(id, PortOut::Event("{\"t\":\"hello\"}".into())));
+    assert_eq!(c.read_frame(), (2, b"\x10{\"t\":\"hello\"}".to_vec()));
+}
+
+#[test]
+fn usj_lines_keep_their_place_among_the_bytes_and_close_releases() {
+    let (web, port) = usj_web();
+    let mut c = Connection::new(&web);
+    assert!(c.upgrade("/usj?x=1").starts_with("HTTP/1.1 101"));
+    c.socket.write_all(&client_frame(2, &[0x00, 0x41], true)).unwrap();    // data before any open
+    assert_eq!(c.read_frame(), (2, b"\x10{\"t\":\"error\",\"error\":\"not open\"}".to_vec()));
+    let mut wire = client_frame(2, &[0x02], true);
+    wire.extend(client_frame(2, &[0x00, 0xc0], true));
+    wire.extend(client_frame(2, &[0x01, 0x01], true));                     // DTR
+    wire.extend(client_frame(2, &[0x00, 0xc1], true));
+    wire.extend(client_frame(2, &[0x01, 0x02], true));                     // RTS
+    // A fragmented data message arrives once, whole, with a ping between its fragments.
+    wire.extend(client_frame(2, &[0x00, 0x01], false));
+    wire.extend(client_frame(9, b"p", true));
+    wire.extend(client_frame(0, &[0x02, 0x03], true));
+    wire.extend(client_frame(1, b"text is ignored here", true));
+    wire.extend(client_frame(2, &[0x7e], true));                            // unknown type: logged, ignored
+    wire.extend(client_frame(2, &[0x03], true));
+    c.socket.write_all(&wire).unwrap();
+    let ev = wait_for(&port, 7);
+    let PortIn::Open(id) = ev[0] else { panic!("{ev:?}") };
+    assert_eq!(ev[1..], [PortIn::Data(vec![0xc0]), PortIn::Lines { dtr: true, rts: false }, PortIn::Data(vec![0xc1]),
+                         PortIn::Lines { dtr: false, rts: true }, PortIn::Data(vec![0x01, 0x02, 0x03]), PortIn::Close(id)]);
+    assert_eq!(c.read_frame(), (10, b"p".to_vec()));
+    assert_eq!(c.read_frame(), (2, b"\x10{\"t\":\"closed\"}".to_vec()));
+    assert!(!port.held());
+    // A close frame is answered with 1000.
+    c.socket.write_all(&client_frame(8, &[0x03, 0xe8], true)).unwrap();
+    assert_eq!(c.read_frame(), (8, vec![0x03, 0xe8]));
+}
+
+#[test]
+fn usj_second_client_is_refused_and_takes_over_after_the_first_leaves() {
+    let (web, port) = usj_web();
+    let mut a = Connection::new(&web);
+    assert!(a.upgrade("/usj").starts_with("HTTP/1.1 101"));
+    a.socket.write_all(&client_frame(2, &[0x02], true)).unwrap();
+    let ev = wait_for(&port, 1);
+    let PortIn::Open(first) = ev[0] else { panic!("{ev:?}") };
+    let mut b = Connection::new(&web);
+    assert!(b.upgrade("/usj").starts_with("HTTP/1.1 101"));
+    b.socket.write_all(&client_frame(2, &[0x02], true)).unwrap();
+    assert_eq!(b.read_frame(), (2, b"\x10{\"t\":\"error\",\"error\":\"busy\"}".to_vec()));
+    drop(a);                                                                 // the first client goes away
+    assert_eq!(wait_for(&port, 1), [PortIn::Close(first)]);
+    b.socket.write_all(&client_frame(2, &[0x02], true)).unwrap();
+    let ev = wait_for(&port, 1);
+    assert!(matches!(ev[0], PortIn::Open(id) if id != first), "{ev:?}");
+}
+
+#[test]
+fn usj_needs_a_port_and_a_local_origin() {
+    let web = socket_web();
+    let mut c = Connection::new(&web);
+    assert!(c.upgrade("/usj").starts_with("HTTP/1.1 404 Not Found\r\n"), "no port in this run");
+    let (web, _port) = usj_web();
+    let mut c = Connection::new(&web);
+    write!(c.socket, "GET /usj HTTP/1.1\r\nHost: localhost\r\nOrigin: https://nickoscope.github.io\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: abc==\r\n\r\n").unwrap();
+    assert!(c.head().starts_with("HTTP/1.1 403 Forbidden\r\n"), "a public page may not reach the port");
+}
