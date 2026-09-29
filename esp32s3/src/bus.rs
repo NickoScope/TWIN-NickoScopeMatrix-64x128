@@ -139,13 +139,16 @@ static BUS_EPOCHS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 
 impl SocBus {
     /// Write a changed flash range through to the backing file, so NVS, LittleFS and OTA slots
-    /// survive the run as they survive a power cycle.
+    /// survive the run as they survive a power cycle. Seek and write through `&File`, which every
+    /// target has (`FileExt::write_at` is Unix-only and stopped the wasm32 build); on wasm32
+    /// `flash_file` is never set, and the calls would only return Unsupported there.
     fn persist_flash(&mut self, off: usize, len: usize) {
-        use std::os::unix::fs::FileExt;
+        use std::io::{Seek, SeekFrom, Write};
         let Some(f) = &self.flash_file else { return };
         let end = (off + len).min(self.flash.len());
         if off >= end { return; }
-        if let Err(e) = f.write_at(&self.flash[off..end], off as u64) { eprintln!("[emu] flash file: write at {:#x}: {}", off, e); }
+        let mut h: &std::fs::File = f;
+        if let Err(e) = h.seek(SeekFrom::Start(off as u64)).and_then(|_| h.write_all(&self.flash[off..end])) { eprintln!("[emu] flash file: write at {:#x}: {}", off, e); }
     }
     pub(crate) fn cancel_spi2_timing(&mut self) { self.spi2_scheduled = None; }
 
