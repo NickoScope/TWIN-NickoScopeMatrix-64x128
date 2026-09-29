@@ -426,9 +426,26 @@ impl Device for FeIq {
 /// expects a response times out (RINTSTS.RTO), as with no card in the socket. The IDF driver then
 /// fails `sdmmc_card_init` with a timeout and the firmware carries on without a card, instead of
 /// spinning forever in `sdmmc_host_reset` on reset bits no hardware clears.
-pub struct Sdmmc { pub ram: RegRam, pub rintsts: u32, pub cmds: u64 }
+///
+/// The slot is empty but its card-detect switch is not wired, and the host does not know it is
+/// empty: CDETECT (0x50) shows the card_detect_n inputs, active low, as the GPIO matrix routes them
+/// (`cdetect`, kept current by `Peripherals::pre_access`). With no CD pin (SDMMC_SLOT_NO_CD, as
+/// SD_MMC.setPins(CLK, CMD, D0) leaves it) IDF routes the input to GPIO_MATRIX_CONST_ZERO_INPUT,
+/// "default to CD low (card present)" (IDF v4.4.7 driver/sdmmc_host.c:472-483). So commands go out
+/// (sdmmc_host_start_command returns ESP_ERR_NOT_FOUND only on a set CDETECT bit, :264), time out,
+/// and card init fails in sdmmc_init_ocr with ESP_ERR_TIMEOUT (0x107), as on hardware.
+///
+/// A response timeout reaches the CPU as two events, RTO and then CMD_DONE: IDF's process_events
+/// takes an RTO in SENDING_CMD and then waits "for the CMD_DONE interrupt" (v4.4.7
+/// driver/sdmmc_transaction.c), and an S3 whose card does not answer logs
+/// "process_command_response: error 0x107  (status=00000100)", RTO alone (esp-idf issue #12986).
+/// Given both in one event, IDF leaves CMD_DONE unhandled and sits out each command's 1 s event
+/// timeout. So CMD_DONE (`cmd_done_due`) rises on the status read after the one that first sees RTO.
+pub struct Sdmmc { pub ram: RegRam, pub rintsts: u32, pub cmds: u64, pub cdetect: u32, pub cmd_done_due: bool }
 impl Sdmmc {
-    pub fn new() -> Self { Sdmmc { ram: RegRam::new(), rintsts: 0, cmds: 0 } }
+    pub fn new() -> Self { Sdmmc { ram: RegRam::new(), rintsts: 0, cmds: 0, cdetect: 0, cmd_done_due: false } }
+    /// A read of MINTSTS or RINTSTS: the value it saw goes back, then a CMD_DONE due behind an RTO rises.
+    fn status_read(&mut self, v: u32) -> u32 { if self.cmd_done_due { self.cmd_done_due = false; self.rintsts |= 1 << 2; } v }
     fn int_on(&self) -> bool { self.ram.read(0x00) & (1 << 4) != 0 }               // CTRL.int_enable
     pub fn irq(&self) -> bool { self.int_on() && self.rintsts & self.ram.read(0x24) != 0 }   // RINTSTS & INTMASK
 }
@@ -439,10 +456,10 @@ impl Device for Sdmmc {
             0x00 => self.ram.read(0x00) & !0x7,                    // CTRL: controller/fifo/dma reset done
             0x2c => self.ram.read(0x2c) & !(1 << 31),             // CMD: start_command taken
             0x30..=0x3c => 0,                                      // RESP0..3: nothing answered
-            0x40 => if self.int_on() { self.rintsts & self.ram.read(0x24) } else { 0 },   // MINTSTS
-            0x44 => self.rintsts,                                  // RINTSTS
+            0x40 => { let v = if self.int_on() { self.rintsts & self.ram.read(0x24) } else { 0 }; self.status_read(v) }   // MINTSTS
+            0x44 => self.status_read(self.rintsts),                // RINTSTS
             0x48 => 1 << 2,                                        // STATUS: FIFO empty, FSMs idle, no card on DAT3
-            0x50 => 0x3,                                           // CDETECT, active low: no card in slot 0 or 1
+            0x50 => self.cdetect,                                  // CDETECT, active low, from the GPIO matrix
             0x80 => self.ram.read(0x80) & !1,                      // BMOD: IDMAC software reset done
             0x8c => 0,                                             // IDSTS
             _ => self.ram.read(off),
@@ -455,8 +472,8 @@ impl Device for Sdmmc {
                 self.ram.write(0x2c, v);
                 if v & (1 << 31) != 0 && v & (1 << 21) == 0 {     // start_command, not update_clk_reg
                     self.cmds += 1;
-                    self.rintsts |= 1 << 2;                        // cmd_done
-                    if v & (1 << 6) != 0 { self.rintsts |= 1 << 8; }   // response_expect: RTO
+                    if v & (1 << 6) != 0 { self.rintsts |= 1 << 8; self.cmd_done_due = true; }   // response_expect: RTO, then cmd_done
+                    else { self.rintsts |= 1 << 2; }               // cmd_done
                 }
             }
             _ => self.ram.write(off, v),
@@ -556,7 +573,7 @@ impl DeviceSet for Peripherals {
     fn block_name(block: u32) -> &'static str { Peripherals::block_name(block) }
     fn misc(&self) -> &Misc { &self.misc }
     fn misc_mut(&mut self) -> &mut Misc { &mut self.misc }
-    /// The three registers whose value depends on another device.
+    /// The registers whose value depends on another device.
     fn pre_access(&mut self, block: u32, _off: u32, write: bool) {
         match block {
             0xc2 if !write => self.intmatrix.status = self.source_status(),   // INTERRUPT_*_STATUS reads the live sources
@@ -564,6 +581,7 @@ impl DeviceSet for Peripherals {
             // IQ estimation is a calibration of the radio itself: silicon completes it with no AP in
             // range too (a panel with no network configured still boots into its setup portal).
             0x06 => self.fe.done = true,
+            0x28 if !write => self.sdmmc.cdetect = self.sd_card_detect_n(),              // SDMMC CDETECT
             _ => {}
         }
     }
@@ -584,6 +602,21 @@ impl Peripherals {
     }
 
     pub fn block_name_pub(block: u32) -> String { Self::block_name(block).to_string() }
+
+    /// The level GPIO-matrix input signal `sig` sees. FUNCn_IN_SEL_CFG holds the source in IN_SEL
+    /// (bits 0..5): a pad, or GPIO_MATRIX_CONST_ONE_INPUT 0x38 / CONST_ZERO_INPUT 0x3C
+    /// (soc/esp32s3/include/soc/gpio_pins.h); IN_INV_SEL (bit 6) inverts. The ROM's gpio_matrix_in
+    /// (0x40050014) writes `gpio | inv << 6 | 0x80`, the 0x80 (SIG_IN_SEL) left out only for 0x3A,
+    /// the IO_MUX bypass. IN_SEL is read here whatever SIG_IN_SEL says: the signals asked about have
+    /// no IO_MUX pad (not checked for the bypass case).
+    pub fn matrix_input(&self, sig: usize) -> bool {
+        let sel = self.gpio.func_in_sel.get(sig).copied().unwrap_or(0x3c);
+        let level = match sel & 0x3f { 0x38 => true, 0x3c => false, p if p < 49 => self.gpio.input >> p & 1 != 0, _ => false };
+        level ^ (sel & 0x40 != 0)
+    }
+    /// SDMMC CDETECT: bit n is slot n's card_detect_n input, SDHOST_CARD_DETECT_N_1_IDX 194 and
+    /// _N_2_IDX 195 (soc/esp32s3/include/soc/gpio_sig_map.h; sdmmc_periph.c binds them to slots 0, 1).
+    pub fn sd_card_detect_n(&self) -> u32 { self.matrix_input(194) as u32 | (self.matrix_input(195) as u32) << 1 }
     fn block_name(block: u32) -> &'static str {
         match block {
             0x00 => "UART0", 0x02 => "SPI1", 0x03 => "SPI0", 0x04 => "GPIO", 0x05 => "FE2", 0x06 => "FE", 0x07 => "EFUSE", 0x08 => "RTC", 0x09 => "IO_MUX",

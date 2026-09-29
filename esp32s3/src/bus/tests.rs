@@ -1293,3 +1293,47 @@ fn stable_pages_move_their_epoch() {
     assert_eq!(bus.stable_pages().1, first - 1, "the last flash page is left to per-page compares");
     assert_eq!(bus.page_versions()[first as usize - 1], before[first as usize - 1] + 3);
 }
+
+#[test]
+fn sdmmc_card_detect_follows_the_gpio_matrix_and_commands_time_out() {
+    const SDMMC: u32 = PERIPH_BASE + 0x28_000;
+    const IN_SEL: u32 = PERIPH_BASE + 0x4_000 + 0x154;          // GPIO_FUNC0_IN_SEL_CFG
+    const CD_N_1: u32 = 194;                                    // SDHOST_CARD_DETECT_N_1_IDX
+    let mut bus = SocBus::new(1024, 1024, [0; 6]);
+    // No CD pin: IDF v4.4.7 sdmmc_host_init_slot routes GPIO_MATRIX_CONST_ZERO_INPUT (0x3C) through
+    // the ROM's gpio_matrix_in, which sets SIG_IN_SEL: 0xBC. Card present, as on hardware.
+    bus.write32(IN_SEL + 4 * CD_N_1, 0xbc).unwrap();
+    bus.write32(IN_SEL + 4 * (CD_N_1 + 1), 0xb8).unwrap();     // slot 1 on constant one: no card
+    assert_eq!(bus.read32(SDMMC + 0x50).unwrap(), 0b10);
+    // A CD switch on GPIO5, active low, and the same switch through IN_INV_SEL.
+    bus.write32(IN_SEL + 4 * CD_N_1, 0x80 | 5).unwrap();
+    bus.periph.gpio.set_input(5, false);
+    assert_eq!(bus.read32(SDMMC + 0x50).unwrap() & 1, 0);
+    bus.periph.gpio.set_input(5, true);
+    assert_eq!(bus.read32(SDMMC + 0x50).unwrap() & 1, 1);
+    bus.write32(IN_SEL + 4 * CD_N_1, 0xc0 | 5).unwrap();
+    assert_eq!(bus.read32(SDMMC + 0x50).unwrap() & 1, 0);
+    // With the card "present" a command goes out; one expecting a response times out. IDF's ISR
+    // (sdmmc_host.c sdmmc_isr) reads MINTSTS, clears what it saw, then reads MINTSTS.sdio: the
+    // RTO event comes first and alone, CMD_DONE keeps the line up for a second event.
+    const RTO: u32 = 1 << 8;
+    const CMD_DONE: u32 = 1 << 2;
+    bus.write32(SDMMC + 0x24, CMD_DONE | RTO).unwrap();         // INTMASK
+    bus.write32(SDMMC, 1 << 4).unwrap();                         // CTRL.int_enable
+    bus.write32(SDMMC + 0x2c, (1 << 31) | (1 << 6) | 8).unwrap(); // start_command, response_expect, CMD8
+    assert_eq!(bus.read32(SDMMC + 0x2c).unwrap() >> 31, 0, "start_command taken");
+    assert!(bus.periph.sdmmc.irq());
+    let pending = bus.read32(SDMMC + 0x40).unwrap();
+    assert_eq!(pending, RTO);
+    bus.write32(SDMMC + 0x44, pending).unwrap();
+    bus.read32(SDMMC + 0x40).unwrap();
+    assert!(bus.periph.sdmmc.irq(), "CMD_DONE still pending");
+    let pending = bus.read32(SDMMC + 0x40).unwrap();
+    assert_eq!(pending, CMD_DONE);
+    bus.write32(SDMMC + 0x44, pending).unwrap();
+    assert!(!bus.periph.sdmmc.irq());
+    // A command with no response (CMD0) is done at once.
+    bus.write32(SDMMC + 0x2c, 1 << 31).unwrap();
+    assert_eq!(bus.read32(SDMMC + 0x44).unwrap(), CMD_DONE);
+    assert_eq!(bus.periph.sdmmc.cmds, 2);
+}
