@@ -41,8 +41,10 @@ pub trait BoardModel {
     /// A complete frame from the LCD_CAM RGB interface (RGB565 little-endian, `w`x`h`).
     fn lcd_frame(&mut self, _w: u32, _h: u32, _rgb565: &[u8]) {}
     /// Words the LCD_CAM i8080 bus clocked out, in order, as little-endian `bus_bytes`-wide words
-    /// (1 or 2), one per PCLK at `pclk_hz`: a parallel bus such as HUB75 driven by DMA.
-    fn lcd_i8080(&mut self, _pclk_hz: u64, _bus_bytes: u8, _words: &[u8]) {}
+    /// (1 or 2), one per PCLK at `pclk_hz`: a parallel bus such as HUB75 driven by DMA. `eof` is
+    /// set when these words end a GDMA descriptor that carries SUC_EOF (a HUB75 driver marks the
+    /// last descriptor of its frame that way).
+    fn lcd_i8080(&mut self, _pclk_hz: u64, _bus_bytes: u8, _words: &[u8], _eof: bool) {}
     /// The board's display for the UI/PNG: (width, height, RGB565 pixels, change counter).
     fn display(&self) -> Option<(u32, u32, Vec<u16>, u64)> { None }
     /// An emissive display's light, for a UI that renders it itself: (width, height, per pixel

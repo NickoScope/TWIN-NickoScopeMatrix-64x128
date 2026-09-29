@@ -617,6 +617,11 @@ impl SocBus {
                 let remaining = length.saturating_sub(c.buf_pos) as usize;
                 if remaining == 0 {
                     if log { eprintln!("[lcd] i80 desc {:#010x} done (buf {:#010x} len {} eof {}) -> next {:#010x}", c.desc, buf, length, eof, next); }
+                    if eof {   // also with no words left: the batch before may have carried them
+                        self.periph.lcd_cam.i80_words += (out.len() / bus_bytes) as u64;
+                        self.board.lcd_i8080(pclk, bus_bytes as u8, &out, true);
+                        out.clear();
+                    }
                     let ch_ref = &mut self.periph.gdma.out[ch];
                     ch_ref.int_raw |= 1 << 0;
                     if eof { ch_ref.int_raw |= 1 << 1; ch_ref.eof_desc = c.desc; }
@@ -633,7 +638,7 @@ impl SocBus {
         }
         if !out.is_empty() {
             self.periph.lcd_cam.i80_words += (out.len() / bus_bytes) as u64;
-            self.board.lcd_i8080(pclk, bus_bytes as u8, &out);
+            self.board.lcd_i8080(pclk, bus_bytes as u8, &out, false);
         }
         self.periph.lcd_cam.i80_buf = out;
     }

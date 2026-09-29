@@ -10,6 +10,7 @@ emu-core = { path = "../emu-core" }
 esp-periph = { path = "../esp-periph" }
 esp-soc = { path = "../esp-soc" }
 xtensa-lx7 = { path = "../xtensa-lx7" }
+hub75 = { path = "../hub75" }
 
 [features]
 cache-inline = ["xtensa-lx7/wasm-cache-inline"]
