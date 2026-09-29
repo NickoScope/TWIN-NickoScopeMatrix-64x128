@@ -87,6 +87,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hub75"
+version = "0.2.0"
+
+[[package]]
 name = "riscv-rv32"
 version = "0.2.0"
 dependencies = [

@@ -1,0 +1,8 @@
+[package]
+name = "hub75"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "HUB75 LED panel twin: decodes the ESP32-S3 LCD_CAM 16-bit word stream into per-LED on-clocks and renders what the panel shows"
+
+[dependencies]
