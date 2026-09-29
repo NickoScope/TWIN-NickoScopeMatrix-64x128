@@ -114,6 +114,7 @@ impl<S: Soc> Machine<S> {
     // Host input is accepted at run boundaries without advancing device time. The periodic
     // poll remains necessary for native callers that run continuously rather than in slices.
     pub(super) fn web_poll_input(&mut self) {
+        self.usj_service();
         let Some(w) = self.web.clone() else { return };
         use crate::json::{parse_json, Json};
         for b in w.poll_incoming_bin() {
@@ -169,6 +170,8 @@ impl<S: Soc> Machine<S> {
                     match field("src").as_deref() {
                         Some("uart0") => self.bus.uart_input(0, data.as_bytes()),
                         Some("uart1") => self.bus.uart_input(1, data.as_bytes()),
+                        // the USB console belongs to the client holding the USB-Serial/JTAG port
+                        _ if self.usj_state.session.is_some() => {}
                         _ => self.bus.serial_input(data.as_bytes()),
                     }
                 }

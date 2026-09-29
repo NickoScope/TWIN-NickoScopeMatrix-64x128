@@ -65,6 +65,7 @@
   form.line { display: flex; gap: 6px; margin-top: 8px; }
   form.line input { flex: 1; min-width: 0; font: 12px var(--mono); color: var(--ink); background: #0a0b0c; border: 1px solid var(--rule); border-radius: 6px; padding: 7px 8px; }
   a { color: var(--amber); }
+  [hidden] { display: none !important; }
   @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 </style>
 </head>
@@ -74,6 +75,8 @@
   <span class="chip"><i class="dot" id="conn"></i><span id="connText">подключение</span></span>
   <span class="chip" id="board">плата —</span>
   <a class="chip" id="portalLink" href="http://127.0.0.1:8080/" target="_blank" rel="noopener" title="Собственный веб-портал прошивки: порт 80 двойника, проброшенный на Mac (twin.py run --http)">портал ↗</a>
+  <a class="chip" id="flasherLink" href="flasher/index.html" target="_blank" rel="noopener" hidden title="Копия веб-прошивальщика проекта: прошивает двойника через его USB-Serial/JTAG (twin.py run --web)">прошивальщик ↗</a>
+  <span class="chip" id="usbClaim" hidden title="Порт USB-Serial/JTAG открыт прошивальщиком: консоль USB идёт ему, ввод отсюда не принимается">USB занят прошивальщиком</span>
   <div class="stats">
     <span>время <b id="stTime">—</b></span>
     <span>кадров/с <b id="stFps">—</b></span>
@@ -305,6 +308,7 @@ void main() {
         if (m.t === 'serial' && m.src === 'usb') appendConsole(m.data);
         else if (m.t === 'board') $('board').textContent = 'плата ' + m.name;
         else if (m.t === 'stat') { $('stTime').textContent = m.time.toFixed(1) + ' с'; $('stBehind').textContent = (m.behind * 1000).toFixed(0) + ' мс'; }
+        else if (m.t === 'usj') { $('usbClaim').hidden = !m.claimed; $('lineIn').disabled = !!m.claimed; }
         return;
       }
       const b = new DataView(ev.data);
@@ -353,6 +357,8 @@ void main() {
   $('rh').addEventListener('input', () => $('rhv').textContent = $('rh').value);
   // The portal link follows the host the page was opened on; the port is twin.py's --http (8080).
   $('portalLink').href = `http://${location.hostname}:8080/`;
+  // The flasher is there when twin.py built the pages (tools/twin/flasher in the firmware repo).
+  fetch('flasher/index.html', { cache: 'no-store' }).then((r) => { if (r.ok) $('flasherLink').hidden = false; }).catch(() => {});
 
   // ---- the knob
   // Its switch is GPIO0, which the firmware samples itself (control.cpp sampleTick): low for 40 ms

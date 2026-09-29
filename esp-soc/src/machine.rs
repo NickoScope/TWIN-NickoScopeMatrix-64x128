@@ -11,10 +11,15 @@ use emu_core::{Bus, Core, CostModel, LifecycleFacts, LifecycleKind, MemoryAccess
 use std::collections::{BTreeMap, HashMap};
 
 mod modeled;
+mod usj;
 mod web;
 
 #[derive(Clone, Debug)]
-pub enum ScriptAction { Gpio(u8, bool), Serial(String), Uart(usize, String), Stop, Touch(u16, u16, bool), Poke(u32, u32), Board(String, String) }
+pub enum ScriptAction { Gpio(u8, bool), Serial(String), Uart(usize, String), Stop, Touch(u16, u16, bool), Poke(u32, u32), Board(String, String),
+    /// `usj <dtr> <rts>`: the USB host sets the USB-Serial/JTAG's lines (as `Machine::usj_lines`)
+    UsjLines(bool, bool),
+    /// `usjhex <hex>`: raw bytes from the USB host into the USB-Serial/JTAG
+    UsjData(Vec<u8>) }
 
 /// The stop conditions that are not observers.
 pub struct Debug { pub stop_on_unimplemented: bool, pub stop_after_exceptions: u64 }
@@ -122,6 +127,12 @@ pub struct Machine<S: Soc> {
     /// at waiti, batches that ran the whole grant, granted rounds, batches the bound refused, reserved.
     pub bb_stats: [u64; 8],
     run_steps: u64,
+    /// The USB-Serial/JTAG's host end (`--web` at `/usj`, `--serial-tcp`), when a front end serves one.
+    pub usj: Option<crate::usj_port::UsjPort>,
+    /// The host's RTS=1/DTR=0 resets the chip (a run that comes back up through the ROM); when
+    /// false the lines are tracked and the reset is only logged.
+    pub usj_reset: bool,
+    usj_state: usj::UsjState,
 }
 
 /// Default scheduling quantum; `Machine::quantum` can change it (not bit-exact with the default). q256: 256 on wasm32,
@@ -154,6 +165,7 @@ impl<S: Soc> Machine<S> {
             web: None, ws: WebState { last_push_cycles: 0, push_interval: 0, audio_sent: 0, ring_updates: 0, grid_updates: Vec::new(), px_pending: 0, px_sent: 0, px_deferred: false, cam_pushed: u64::MAX, cam_sent: false },
             rt: Realtime { enabled: false, wall_start: None, last_check: 0, behind: 0.0, resyncs: 0, speed: None, speed_mark: None, log: false, log_last: None, log_insns: (0, 0) },
             debug_rom: false, cost: None, model_accesses: Vec::new(), approximate_jit_timing: None, approximate_cpi_frac: 0, approximate_cpi_acc: 0, approximate_jit_frontiers: false, model_ready_at: vec![0; S::CORES], model_stop: None, model_attach_error: None,
+            usj: None, usj_reset: false, usj_state: usj::UsjState::default(),
         }
     }
 
@@ -302,6 +314,7 @@ impl<S: Soc> Machine<S> {
         let cause = self.bus.reboot(self.mac);
         for (i, c) in self.cores.iter_mut().enumerate() { S::reset_core(c, i); if i > 0 { self.core_held[i] = true; } }
         self.reboots += 1;
+        self.usj_after_reboot();
         self.model_ready_at.fill(self.bus.cycles());
         if let Some(model) = &mut self.cost {
             let facts = LifecycleFacts { kind: LifecycleKind::ChipReset, chip: S::NAME, cores: S::CORES, cpu_hz: S::CPU_HZ };
@@ -336,6 +349,15 @@ impl<S: Soc> Machine<S> {
             let _ = o.flush();
         };
         for (i, d) in streams.into_iter().enumerate() {
+            // While a client holds the USB-Serial/JTAG port its output is that client's alone.
+            if i == 0 && !d.is_empty() {
+                if let (Some(id), Some(port)) = (self.usj_state.session, &self.usj) {
+                    self.usj_state.bytes_out += d.len() as u64;
+                    self.console.all.extend_from_slice(&d);
+                    port.deliver(id, crate::usj_port::PortOut::Data(d));
+                    continue;
+                }
+            }
             let src = ["usb", "uart0", "uart1", "uart2"][i];
             if i < 2 {
                 let backlog = if i == 0 { &mut self.console.usb } else { &mut self.console.uart0 };
@@ -485,6 +507,7 @@ impl<S: Soc> Machine<S> {
     /// `quantum - 1` steps. The modeled path schedules one priced event at a time.
     pub fn run(&mut self, max_insns: u64) -> Stop {
         self.web_poll_input();
+        if self.usj_held() { if let Some(stop) = self.hold_in_reset() { return stop; } }
         self.refresh_irq();
         if self.cost.is_some() { self.run_modeled(max_insns) } else if self.approximate_jit_frontiers { self.run_approximate_jit_frontiers(max_insns) } else if self.approximate_jit_timing.is_some() { self.run_unmodeled::<true>(max_insns) } else { self.run_unmodeled::<false>(max_insns) }
     }
@@ -1000,6 +1023,7 @@ impl<S: Soc> Machine<S> {
     fn apply_due_script_events(&mut self) -> bool {
         let mut stopped = false;
         while self.script.pos < self.script.events.len() && self.script.events[self.script.pos].0 <= self.bus.cycles() {
+            if self.usj_state.reset_pending { break; }   // a USB line reset first takes effect
             let (t, a) = self.script.events[self.script.pos].clone(); self.script.pos += 1;
             if self.script.log { eprintln!("[script] t={:.3}s {:?}", t as f64 / S::CPU_HZ as f64, a); }
             match a {
@@ -1010,6 +1034,9 @@ impl<S: Soc> Machine<S> {
                 ScriptAction::Touch(x, y, d) => { self.bus.touch_input(x, y, d); }
                 ScriptAction::Poke(a, v) => { let _ = self.bus.write32_unpriced(a, v); }
                 ScriptAction::Board(cmd, args) => { if let Err(e) = self.bus.board_input(&cmd, &args) { eprintln!("[script] {}", e); } }
+                ScriptAction::UsjData(bytes) => self.bus.serial_input(&bytes),
+                // A chip reset must happen before anything later: the rest waits for the reboot.
+                ScriptAction::UsjLines(dtr, rts) => if self.usj_lines(dtr, rts) { break; },
             }
         }
         stopped
@@ -1023,6 +1050,7 @@ impl<S: Soc> Machine<S> {
         // EX168 s4: the per-round test is two loads and a compare; the re-derivation, the push and the
         // pacing clock live out of line.
         if self.web.is_some() && self.bus.cycles().wrapping_sub(self.ws.last_push_cycles) >= self.ws.push_interval { self.web_push_due(); }
+        if self.bus.cycles() >= self.usj_state.next { self.usj_service(); }
         if self.rt.enabled && self.bus.cycles().wrapping_sub(self.rt.last_check) >= 1 << 16 { self.rt_pace(); }
         stopped
     }
@@ -1073,6 +1101,7 @@ impl<S: Soc> Machine<S> {
     // ------------------------------------------------------------------ scripts
     /// Parse a script: one action per line, `<seconds> <cmd> [args]`.
     ///   press <pin> [ms]   release <pin>   gpio <pin> <0|1>   serial <text...>   knob <cw|ccw> [detents]   touch <x> <y> <0|1>   poke <addr> <value>   stop
+    ///   usj <dtr 0|1> <rts 0|1> (the USB host's lines)   usjhex <hex> (raw bytes into the USB-Serial/JTAG)
     /// Pins are numbers or the board's names (`btn1`, `sw`, ...); buttons/encoder are active-low with pull-ups (release = 1).
     /// A board's own verbs (`BoardModel::check_input`) come first and may take over `press`/`knob`.
     pub fn load_script(&mut self, text: &str) -> Result<(), String> {
@@ -1113,6 +1142,16 @@ impl<S: Soc> Machine<S> {
                     }
                 }
                 "stop" => ev.push((c, ScriptAction::Stop)),
+                "usj" => {
+                    let bit = |x: Option<&str>| match x { Some("0") => Ok(false), Some("1") => Ok(true), _ => Err(format!("line {}: usj <dtr 0|1> <rts 0|1>", ln + 1)) };
+                    let mut p = rest.split_whitespace();
+                    ev.push((c, ScriptAction::UsjLines(bit(p.next())?, bit(p.next())?)));
+                }
+                "usjhex" => {
+                    let h: String = rest.split_whitespace().collect();
+                    if h.is_empty() || !h.len().is_multiple_of(2) || !h.bytes().all(|b| b.is_ascii_hexdigit()) { return Err(format!("line {}: usjhex wants an even number of hex digits", ln + 1)); }
+                    ev.push((c, ScriptAction::UsjData((0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect())));
+                }
                 _ => return Err(format!("line {}: unknown command {}", ln + 1, cmd)),
             }
         }

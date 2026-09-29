@@ -135,6 +135,13 @@ pub trait SocBus: Bus {
     fn set_psram_size(&mut self, _bytes: usize) -> Result<(), String> { Err("this chip has no PSRAM".into()) }
     /// Strapping pins as the ROM reads them.
     fn set_strap(&mut self, v: u32);
+    /// GPIO_STRAPPING as the ROM will read it, on chips that model the latch.
+    fn strap(&self) -> Option<u32> { None }
+    /// The USB host set the USB-Serial/JTAG's DTR and RTS (`esp_periph::UsjLines`). A chip whose
+    /// model has no line-driven reset only transports data and answers `None`.
+    fn usj_lines(&mut self, _dtr: bool, _rts: bool) -> esp_periph::LineEffect { esp_periph::LineEffect::None }
+    /// The host's line state, where the chip models it.
+    fn usj_line_state(&self) -> Option<esp_periph::UsjLines> { None }
     /// The reset cause the ROM will report (to reproduce a real board's boot).
     fn set_reset_cause(&mut self, cause: u32);
     /// Chip-specific end-of-run statistics (audio, WiFi, crypto, DMA engines).

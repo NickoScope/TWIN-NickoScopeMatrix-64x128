@@ -104,7 +104,25 @@ pub struct SocBus {
     approximate_cache_yield_miss: bool,
     cache_resource: CacheResource,
     pub(crate) fetch_cache: xtensa_lx7::state::SharedFetchCache,
+    /// The USB host's DTR/RTS on the USB-Serial/JTAG (ESP32-S3 TRM v1.8 Table 33.3-2): host-side
+    /// state with no guest register, kept across the peripheral re-creation of a chip reset.
+    pub usj: esp_periph::UsjLines,
+    /// GPIO_STRAPPING as the last Chip Reset latched it: `--strap`, with the board's GPIO0/GPIO46
+    /// at a power-on reset. A USB download reset clears bits [3:2] of it for one boot (`reboot`).
+    pub strap_latched: u32,
+    /// 64 KiB pages of the reserved data window already reported (`RESERVED_DATA`).
+    reserved_reads: std::collections::BTreeSet<u32>,
 }
+
+/// Reads here answer 0 instead of faulting. The S3's data bus maps internal ROM 1 up to
+/// 0x3FF1_FFFF (TRM v1.8 Table 4.3-1, p.403) and no table of chapter 4 maps the rest of this
+/// window; esptool-js 0.6.0 reads the ESP32's eFuse words 3 and 5 (0x3FF5A00C, 0x3FF5A014) and
+/// APB_CTL_DATE (0x3FF6607C) from an ESP32-S3 through the ROM's READ_REG, because its S3 target
+/// does not override `getChipRevision` (targets/esp32.ts:79-99, esploader.ts:719, 1242, 1307).
+/// The page flashed a real panel with those reads in it (2026-09-21), so silicon does not stop
+/// the ROM there; which value it returns is not verified — 0 gives "revision 0". Writes and
+/// instruction fetches here still fault.
+pub const RESERVED_DATA: std::ops::RangeInclusive<u32> = 0x3FF2_0000..=0x3FFF_FFFF;
 
 /// One shared external resource, occupied only by priced fills/writebacks.
 /// Requests within a compiled batch are serialized at its supplied start time.
@@ -171,8 +189,10 @@ impl SocBus {
             approximate_cache_yield_miss: false,
             cache_resource: CacheResource::default(),
             fetch_cache: xtensa_lx7::state::SharedFetchCache::default(),
+            usj: Default::default(), strap_latched: 0, reserved_reads: Default::default(),
         };
         let mut b = bus_uninit;
+        b.strap_latched = b.periph.gpio.strap;
         b.rebuild_page_table();
         b
     }
@@ -636,9 +656,19 @@ impl CacheResource {
 
 impl SocBus {
     // Const specialization keeps origin checks and CPU pricing out of DMA/host accessors.
+    /// A read nothing maps: 0 in `RESERVED_DATA`, reported once per 64 KiB page; a fault elsewhere.
+    #[cold]
+    fn unmapped_read(&mut self, addr: u32) -> Result<(), Fault> {
+        if RESERVED_DATA.contains(&addr) {
+            if self.reserved_reads.insert(addr >> 16) { eprintln!("[emu] read of reserved {:#010x} -> 0 (esptool-js reads ESP32 revision registers here)", addr); }
+            return Ok(());
+        }
+        self.last_fault = Some((addr, false));
+        Err(Fault::Unmapped)
+    }
     fn read8_access<const CPU: bool>(&mut self, addr: u32) -> Result<u8, Fault> {
         if Self::is_periph(addr) { self.last_fault = Some((addr, false)); return Err(Fault::Prohibited); }
-        let Some(e) = self.lookup(addr) else { self.last_fault = Some((addr, false)); return Err(Fault::Unmapped) };
+        let Some(e) = self.lookup(addr) else { return self.unmapped_read(addr).map(|()| 0) };
         if CPU { self.price_cached_data(e, addr, 1, false); }
         Ok(self.buf(e.src as u8)[e.off as usize + (addr - e.lo) as usize])
     }
@@ -647,7 +677,7 @@ impl SocBus {
         match self.lookup(addr) {
             Some(e) if e.hi - addr >= 2 => { if CPU { self.price_cached_data(e, addr, 2, false); } let o = e.off as usize + (addr - e.lo) as usize; Ok(u16::from_le_bytes(self.buf(e.src as u8)[o..o + 2].try_into().unwrap())) }
             Some(_) => Ok(u16::from_le_bytes([self.read8_access::<CPU>(addr)?, self.read8_access::<CPU>(addr + 1)?])),       // straddles a page
-            None => { self.last_fault = Some((addr, false)); Err(Fault::Unmapped) }
+            None => self.unmapped_read(addr).map(|()| 0),
         }
     }
     fn read32_access<const CPU: bool>(&mut self, addr: u32) -> Result<u32, Fault> {
@@ -658,7 +688,7 @@ impl SocBus {
         match self.lookup(addr) {
             Some(e) if e.hi - addr >= 4 => { if CPU { self.price_cached_data(e, addr, 4, false); } let o = e.off as usize + (addr - e.lo) as usize; Ok(u32::from_le_bytes(self.buf(e.src as u8)[o..o + 4].try_into().unwrap())) }
             Some(_) => Ok(u32::from_le_bytes([self.read8_access::<CPU>(addr)?, self.read8_access::<CPU>(addr + 1)?, self.read8_access::<CPU>(addr + 2)?, self.read8_access::<CPU>(addr + 3)?])),
-            None => { self.last_fault = Some((addr, false)); Err(Fault::Unmapped) }
+            None => self.unmapped_read(addr).map(|()| 0),
         }
     }
     fn write8_access<const CPU: bool>(&mut self, addr: u32, v: u8) -> Result<(), Fault> {

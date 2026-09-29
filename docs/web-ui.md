@@ -73,4 +73,23 @@ upload and the webcam (4 fps). Frames up to 8 MB are accepted.
 ## Sending is never blocking
 
 Each client has a writer thread with a bounded queue; when a tab is frozen or slow, frames
-are dropped for that client and the emulator keeps running at real time.
+are dropped for that client and the emulator keeps running at real time. `/usj` below is the
+exception: a serial port may not lose bytes, so its queues are unbounded both ways.
+
+## The USB-Serial/JTAG as a serial port: `/usj` and `--serial-tcp`
+
+`ws://127.0.0.1:PORT/usj` carries the chip's USB-Serial/JTAG as a serial port, for a page that
+stands in for `navigator.serial` (the browser flasher). Binary frames, first byte the type:
+`0x00` data, `0x01` DTR/RTS (bit 0 DTR, bit 1 RTS), `0x02` open, `0x03` close from the page;
+`0x00` data and `0x10` JSON events (`hello`, `error` busy/not open, `closed`, `reset`, `release`)
+from the emulator. The table and the event fields are in the header of `esp-soc/src/web.rs`.
+`--serial-tcp PORT` serves the same port as RFC 2217 for pyserial tools (`esp-soc/src/rfc2217.rs`),
+so `esptool --port rfc2217://127.0.0.1:PORT --before usb_reset` flashes the emulated chip.
+
+One client at a time holds the port, across both. Its bytes and line changes reach the chip in
+the order sent, every millisecond of device time. DTR/RTS act as on the chip (ESP32-S3 TRM
+Table 33.3-2): RTS=0/DTR=1 sets the download flag, RTS=0/DTR=0 clears it, RTS=1/DTR=0 resets the
+chip (cause 0x15) and holds it until the pair changes, and with the flag set it boots into joint
+download mode. Closing the port drops both lines. While the port is held the USB console goes to
+its client only; `/ws` gets `{"t":"usj","claimed":true|false}`. `hw/usjprobe.py PORT` drives the
+whole sequence without a browser.
