@@ -378,6 +378,30 @@ fn reboot_keeps_what_silicon_keeps() {
     assert!(!m.dump_regs().contains("core1:"), "core 1 is back in reset");
 }
 
+/// Review 6: a chip reset keeps the virtual network (lease, forwards, UDP) but the NAT forgets the
+/// station's TCP flows. The rebooted guest's fixed-seed RNG draws the same local ports, and a
+/// flow left over from the last boot would swallow its SYNs.
+#[test]
+fn reboot_leaves_the_network_but_forgets_the_stations_tcp_flows() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut m = machine();
+    let mut net = esp32s3::net::VirtualNet::new(false);
+    net.nat = Some(esp32s3::nat::Nat::new(false));
+    m.bus.periph.wifi.net = Some(net);
+    let mut syn = vec![0u8; 20];
+    syn[..2].copy_from_slice(&0xdc22u16.to_be_bytes()); syn[2..4].copy_from_slice(&port.to_be_bytes());
+    syn[4..8].copy_from_slice(&7000u32.to_be_bytes()); syn[12] = 0x50; syn[13] = 0x02; syn[14..16].copy_from_slice(&5840u16.to_be_bytes());
+    let nat = m.bus.periph.wifi.net.as_mut().unwrap().nat.as_mut().unwrap();
+    nat.tcp_in(&[2; 6], &[10, 0, 2, 15], &[127, 0, 0, 1], &syn, 0);
+    assert_eq!(nat.tcp_flows(), 1, "the guest's SYN opened a flow");
+    m.cores[0].pc = IRAM;
+    m.bus.periph.rtc.reset_cause = esp_periph::RST_SW_CPU;
+    m.reboot();
+    let net = m.bus.periph.wifi.net.as_ref().expect("the network outlives the chip reset");
+    assert_eq!(net.nat.as_ref().unwrap().tcp_flows(), 0, "the old boot's TCP flows are gone");
+}
+
 /// Host touch keeps its intended board-edge timestamp and is applied at the fast scheduler's next
 /// existing bus tick, which is bounded by one instruction quantum.
 #[test]

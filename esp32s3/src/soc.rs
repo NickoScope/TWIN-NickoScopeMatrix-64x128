@@ -135,9 +135,12 @@ impl esp_soc::SocBus for SocBus {
         p.i2s0.pcm = old.i2s0.pcm; p.i2s0.frames_out = old.i2s0.frames_out; p.i2s1.pcm = old.i2s1.pcm; p.i2s1.frames_out = old.i2s1.frames_out;   // keep the captured audio continuous
         // The virtual AP and the network behind it are the world outside the chip: a reset leaves
         // them there. The AP forgets the station (it must associate again), the network keeps its
-        // NAT flows, forwarded host ports and lease, as a router would for a rebooting client.
+        // forwarded host ports, lease and UDP flows, as a router would for a rebooting client. The
+        // station's TCP connections died with its stack: the NAT forgets them, or the rebooted
+        // guest, whose fixed-seed RNG draws the same local ports, meets its old flows (review 6).
         p.wifi.ap = old.wifi.ap.map(|a| { let stats = a.stats; let mut n = crate::wifi::VirtualAp::new(a.cfg, a.log); n.stats = stats; n });
         p.wifi.net = old.wifi.net;
+        if let Some(nat) = p.wifi.net.as_mut().and_then(|n| n.nat.as_mut()) { nat.station_reset(); }
         self.mmu = [MMU_INVALID; MMU_ENTRIES];
         self.invalidate_tlb();
         self.reset_approximate_cache();

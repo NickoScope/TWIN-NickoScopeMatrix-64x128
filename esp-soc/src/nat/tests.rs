@@ -513,3 +513,79 @@ fn forwarded_udp_arrives_from_the_gateway_and_answers_reach_the_last_peer() {
     assert!(nat.udp.is_empty(), "an answer to a forwarded datagram is not a new outbound flow");
     assert_eq!((nat.fwd_udp_in, nat.fwd_udp_out), (1, 1));
 }
+
+// ---- A guest that reboots and draws the same ports (review 6) ----
+
+/// A chip reset takes the station's TCP stack with it: every TCP flow goes and its host socket
+/// closes, the forwarded ports, the lease and the UDP flows stay, and the forward still works.
+#[test]
+fn station_reset_forgets_tcp_flows_and_keeps_forwards_lease_and_udp() {
+    let receiver = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let mut nat = Nat::new(false);
+    let at = tcp_forward(&mut nat);
+    nat.station = Some(STATION);
+    let mut forwarded = client(at);
+    establish(&mut nat, 7000);
+    let (socket, mut outbound) = socket_pair();
+    let mut c = flow(); c.transport = Transport::Connected(socket); nat.tcp.push(c);
+    let mut c = flow(); c.guest_port = 1235; c.transport = Transport::TimeWait; nat.tcp.push(c);
+    nat.udp_out(&[2; 6], &[10, 0, 2, 15], 1234, &[127, 0, 0, 1], &[127, 0, 0, 1], receiver.local_addr().unwrap().port(), b"ntp", 3);
+    assert_eq!((nat.tcp.len(), nat.udp.len()), (3, 1));
+    nat.station_reset();
+    assert!(nat.tcp.is_empty());
+    assert_eq!((nat.udp.len(), nat.forwards.len(), nat.station), (1, 1, Some(STATION)));
+    let mut byte = [0; 1];
+    for host in [&mut forwarded, &mut outbound] {
+        assert!(!matches!(host.read(&mut byte), Ok(1)), "the host side sees the connection end");
+    }
+    let _again = client(at);
+    let syn = seen(&poll_ready(&mut nat, 4)[0]);
+    assert_eq!((syn.flags, syn.dport), (SYN, 80), "the forward takes new connections after the reset");
+}
+
+/// Without a reset notice, a SYN from a port the NAT still holds a synchronized flow for gets a
+/// challenge ACK (RFC 9293 3.10.7.4); the guest's reset closes the flow and its immediate SYN
+/// opens a new one. The dropped SYN does not refresh the stale flow's idle timer.
+#[test]
+fn a_syn_on_a_synchronized_flow_gets_a_challenge_ack_and_the_port_reconnects() {
+    let (socket, _host) = socket_pair();
+    let mut c = flow(); c.transport = Transport::Connected(socket);
+    let mut nat = Nat::new(false); nat.tcp.push(c);
+    let reply = nat.tcp_in(&[2; 6], &[10, 0, 2, 15], &[127, 0, 0, 1], &segment(5000, 0, SYN, &[]), 1_000);
+    assert_eq!(reply.len(), 1);
+    let s = seen(&reply[0]);
+    assert_eq!((s.flags, s.seq, s.ack), (ACK, 100, 200), "<SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>");
+    assert_eq!(nat.tcp[0].last_activity_us, 0, "a dropped SYN keeps no flow alive");
+    // lwIP in SYN-SENT: RST with the challenge's ACK as its sequence number, then the SYN again.
+    nat.tcp_in(&[2; 6], &[10, 0, 2, 15], &[127, 0, 0, 1], &segment(200, 5001, RST | ACK, &[]), 1_001);
+    assert!(nat.tcp[0].closed());
+    let (_tx, rx) = channel();
+    assert!(nat.tcp_in_with_connect(&[2; 6], &[10, 0, 2, 15], &[127, 0, 0, 1], &segment(5000, 0, SYN, &[]), 1_002, |_| Some(rx)).is_empty());
+    assert_eq!(nat.tcp.len(), 1);
+    assert!(matches!(nat.tcp[0].transport, Transport::Connecting(_)));
+    assert_eq!((nat.tcp[0].guest_seq, nat.tcp[0].last_activity_us), (5001, 1_002));
+}
+
+/// TIME-WAIT answers only a retransmitted FIN, and only that restarts its timer (RFC 9293
+/// 3.10.7.4, eighth step); a pure SYN on its 4-tuple is a new connection (3.6.1, MAY-2).
+#[test]
+fn time_wait_is_kept_only_by_a_fin_and_a_new_syn_replaces_it() {
+    let mut c = flow(); c.transport = Transport::TimeWait;
+    let mut nat = Nat::new(false); nat.tcp.push(c);
+    assert!(nat.tcp_in(&[2; 6], &[10, 0, 2, 15], &[127, 0, 0, 1], &segment(200, 100, ACK, &[]), 10).is_empty());
+    assert_eq!(nat.tcp[0].last_activity_us, 0);
+    let ack = nat.tcp_in(&[2; 6], &[10, 0, 2, 15], &[127, 0, 0, 1], &segment(199, 100, FIN | ACK, &[]), 20);
+    assert_eq!(seen(&ack[0]).flags, ACK);
+    assert_eq!(nat.tcp[0].last_activity_us, 20);
+    // Retries of anything else never hold it past its 2 MSL.
+    nat.tcp_in(&[2; 6], &[10, 0, 2, 15], &[127, 0, 0, 1], &segment(200, 100, ACK, &[]), TIME_WAIT_US);
+    nat.poll(TIME_WAIT_US + 20);
+    assert!(nat.tcp.is_empty());
+    let mut c = flow(); c.transport = Transport::TimeWait;
+    nat.tcp.push(c);
+    let (_tx, rx) = channel();
+    nat.tcp_in_with_connect(&[2; 6], &[10, 0, 2, 15], &[127, 0, 0, 1], &segment(9000, 0, SYN, &[]), 30, |_| Some(rx));
+    assert_eq!(nat.tcp.len(), 1);
+    assert!(matches!(nat.tcp[0].transport, Transport::Connecting(_)));
+    assert_eq!(nat.tcp[0].guest_seq, 9001);
+}
