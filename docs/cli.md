@@ -41,7 +41,7 @@ PSRAM and register presets.
 | `--max-insns N` | cap scheduler work across all reboots (details below); unavailable with `--cooja`, which uses `--max-seconds` |
 | `--script F` | host actions at emulated times (below) |
 | `--console usb\|uart0\|both\|all\|none`, `--console-prefix` | which consoles to print |
-| `--realtime` | pace to wall time without the UI |
+| `--realtime` | pace to wall time without the UI: a lag is caught up at most 1.5× real time; time the engine did not run (over 1 s: a stopped process), a lag beyond 30 s or a host sleep is given up with an `[emu] real time:` line |
 | `--web PORT [--web-dir DIR]` | browser UI (implies real time); also the USB-Serial/JTAG as a serial port at `ws://127.0.0.1:PORT/usj` (protocol in `esp-soc/src/web.rs`) |
 | `--serial-tcp PORT` | the USB-Serial/JTAG as an RFC 2217 port on 127.0.0.1:PORT for pyserial tools: `esptool --port rfc2217://127.0.0.1:PORT --before usb_reset …`. Data both ways without loss; DTR/RTS reset the chip as the controller does (ESP32-S3 TRM Table 33.3-2: RTS=1/DTR=0 resets and holds it, the download flag set by RTS=0/DTR=1 picks download mode, cause 0x15), with `--boot rom` and reboots allowed; a run without them carries data only. One client at a time holds the port, over this and `/usj` together; while one does, the USB console goes to it and not to stdout or the page |
 | `--cam-image F`, `--cam-fps N` | camera source for boards with a camera |

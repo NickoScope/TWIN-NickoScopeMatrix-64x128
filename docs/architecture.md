@@ -159,8 +159,10 @@ its pending device-time flush. Device models see time lazily: cycles accumulate 
 batch when a timer alarm is due, when a peripheral register is accessed (so registers always
 read exact time), or after 256 cycles at most. Peripheral clocks (APB 80 MHz, systimer 16 MHz,
 RTC slow 150 kHz) are derived from the 240 MHz cycle counter with delivered-tick accounting.
-With `--web` the machine is paced to wall time (sleeping when ahead, resynchronising rather
-than bursting if it falls > 0.5 s behind). Work that costs host syscalls — reading the NAT's
+With `--web` the machine is paced to wall time: sleeping when ahead, catching a lag up at most
+1.5× real time, and giving time up (logged) only when the engine did not run for over 1 s (a
+stopped process), beyond 30 s of lag, or across a host sleep, because the guest's clock of day
+counts emulated time (`machine/pace.rs`). Work that costs host syscalls — reading the NAT's
 sockets — runs on its own emulated-time cadence rather than every round, because at 240 MHz a
 per-round syscall costs more than the instructions it interleaves with.
 

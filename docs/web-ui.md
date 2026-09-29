@@ -22,8 +22,11 @@ Local native clients may omit `Origin`; the server treats those tools as trusted
 See the [Origin check](../esp-soc/src/web.rs) for the implementation.
 
 The header shows emulated time, instructions, frames, and `real time` / `⚠ N% of real time` /
-resync count. The percentage is emulated seconds per wall second over the last second: a
-resynchronisation resets the lag but not this, so a run that cannot keep up stays visible. The audio buffer is adaptive: it starts at 60 ms and grows on underrun (up to
+resync count. A lag is caught up at most 1.5× real time; a resync gives up the time the engine
+did not run (a stopped process), a lag beyond 30 s, or the time the host slept, and says so on
+stderr. The percentage is emulated seconds per wall
+second over the last second: a resync resets the lag but not this, so a run that cannot keep up
+stays visible. The audio buffer is adaptive: it starts at 60 ms and grows on underrun (up to
 400 ms) so a busy firmware phase (a full display redraw) does not produce gaps.
 
 ## Emulator → browser

@@ -323,12 +323,14 @@ The Pocket Synth firmware runs at real time with margin while idle or playing no
 place it cannot keep up is a full display redraw, where core 1 runs 100 % busy bit‑banging SPI
 (4.8 M instructions per 20 ms — 240 Minsn/s needed, ~70 Minsn/s achieved on an M‑series
 MacBook). Each redraw therefore costs ~0.3 s of lag, which the UI's adaptive audio buffer
-absorbs (it grows on underrun, up to 400 ms) and the pacer recovers afterwards; if the
-emulator ever falls more than 0.5 s behind it resynchronises instead of bursting. The header
-shows `real time`, `⚠ N s behind` and the resync count.
+absorbs (it grows on underrun, up to 400 ms) and the pacer recovers afterwards, at most 1.5×
+real time, so the emulated clock does not drift from the host's. Only time the engine did not run
+(a stopped process), a lag beyond 30 s (a host that cannot keep up) or a host sleep is given up,
+with a `[emu] real time:` line on stderr (`esp-soc/src/machine/pace.rs`). The header shows `real time`, `⚠ N s behind` and the
+count of such resyncs.
 
 `ESP_EMU_RT_LOG=1` prints every 20 ms window that took > 40 ms wall with both cores'
-instruction counts and PCs. `hw/wsdrive.py [port] [seconds]` drives the UI protocol without a
+instruction counts and PCs, and each lag over 50 ms once it is repaid. `hw/wsdrive.py [port] [seconds]` drives the UI protocol without a
 browser (button presses + knob turns) and reports push gaps, lag and audio delivered — use it
 to measure changes to the scheduler.
 

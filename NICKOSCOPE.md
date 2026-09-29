@@ -26,7 +26,9 @@ LEDs would show, and can operate the IR remote and the knob. The fork's work is 
   - `--hostfwd tcp|udp:HOST-GUEST`: inbound forwarding on 127.0.0.1.
   - `--net bridge:PATH`: the guest on the real LAN through socket_vmnet (vmnet bridged).
   - A lossless USB-Serial/JTAG channel (`/usj`), DTR/RTS resets per the ESP32-S3 TRM, and RFC 2217 (`--serial-tcp`). The ESP Web Tools web flasher and esptool flash the guest as they would a chip.
-- **Timing:** `--cpi N.N`, a fractional uniform cycles per instruction, calibrated against the panel.
+- **Timing**
+  - `--cpi N.N`, a fractional uniform cycles per instruction, calibrated against the panel.
+  - Real-time pacing catches a lag up (at most 1.5× real time) instead of dropping any lag over 0.5 s, so the firmware's clock of day stays with the world between its NTP syncs; only time the engine did not run (a stopped process), a lag beyond 30 s or a host sleep is given up, and logged.
 
 How to run the twin, and the design with its sources: `tools/twin/` in AnimatedPixelClock.
 
