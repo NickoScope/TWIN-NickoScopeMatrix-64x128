@@ -20,11 +20,32 @@ pub struct SpiMem {
     pub jedec: [u8; 3],
     pub is_spi1: bool,
     pub log: bool,
-    /// octal PSRAM (APS6408-like) mode registers MR0..MR8, device on CS1 (SPI1 only)
+    /// octal PSRAM (APS6408-like) mode registers MR0..MR8, device on CS1 (SPI1 only).
+    /// MR2's density field follows the array size (`set_psram_size`); the reset value says 64 Mbit.
     pub psram_mr: [u8; 9],
 }
+
+/// MR2[2:0], the density code of an AP Memory octal PSRAM, for an array of `bytes`: 001 32 Mbit,
+/// 011 64 Mbit, 101 128 Mbit, 111 256 Mbit, the rest reserved. IDF v4.4.7
+/// components/esp_hw_support/port/esp32s3/opiram_psram.c:66-73 (`mr2`: density 3 bits, dev_id 2,
+/// rsvd 2, gb 1, LSB first) and :264-267 (the codes it accepts), turned into bytes by
+/// port/esp32s3/spiram.c:318-333; the same table is APS12808L-OBMx datasheet Rev 3.0a §7.7 Table 12.
+/// None for a size the field cannot say: IDF 4.4.7 would read a reserved code as 0, which is
+/// PSRAM_SIZE_16MBITS (spiram_psram.h:21), a size no octal part reports.
+pub fn opi_psram_density(bytes: usize) -> Option<u8> {
+    [(4usize << 20, 0b001), (8 << 20, 0b011), (16 << 20, 0b101), (32 << 20, 0b111)].iter().find(|&&(n, _)| n == bytes).map(|&(_, d)| d)
+}
+
 impl SpiMem {
     pub fn new(is_spi1: bool) -> Self { SpiMem { has_psram: true, regs: RegRam::new(), dirty: Vec::new(), w: [0; 16], pending_cmd: 0, status: 0x200, jedec: [0x20, 0x40, 0x17], is_spi1, log: false , psram_mr: [0x09, 0x0d, 0x8b, 0x00, 0x20, 0, 0, 0, 0x03] } }
+    /// The PSRAM on CS1 is `bytes` long: MR2 reports it in its density field, the only thing IDF
+    /// sizes the array by (opiram_psram.c:264). Device id and good-die bits keep their values.
+    /// A size the field cannot encode leaves MR2 alone and returns false.
+    pub fn set_psram_size(&mut self, bytes: usize) -> bool {
+        let Some(d) = opi_psram_density(bytes) else { return false };
+        self.psram_mr[2] = (self.psram_mr[2] & !0x07) | d;
+        true
+    }
     pub fn read(&self, off: u32) -> u32 {
         match off {
             0x0 => 0,                                   // CMD: always idle after execution

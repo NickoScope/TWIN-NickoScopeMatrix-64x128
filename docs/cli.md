@@ -22,7 +22,7 @@ PSRAM and register presets.
 | `--mac xx:xx:xx:xx:xx:xx` | the station MAC the efuses report |
 | `--serial TEXT` | bytes into the USB-Serial/JTAG console before the run |
 | `--elf F` (repeatable) | symbols for logs/profiles (app ELF, bootloader ELF) |
-| `--flash-mb N`, `--psram-mb N` | flash size (JEDEC follows it) and octal PSRAM size (default 8 / 2) |
+| `--flash-mb N`, `--psram-mb N` | flash size (JEDEC follows it) and octal PSRAM size (default 8 / 2; MR2's density follows it for 4, 8, 16 and 32, the only sizes it can report — any other size reads as 64 Mbit, so IDF maps 8 MB) |
 | `--board atech14\|waveshare-cam\|waveshare-lcd4b\|waveshare-amoled18-v2\|hub75-panel\|none` | board model (default atech14); on the C6: `waveshare-c6-lcd147` or `none` |
 | `--strap HEX`, `--reset-cause HEX`, `--efuse-regs F`, `--regs-init F` | reproduce a real chip's boot state (used by the differential tests) |
 | `--no-reboot` | stop at the first chip reset instead of rebooting from ROM |

@@ -2,7 +2,7 @@
 //! mechanics from outside the crate: dispatch by block and range, `delta`, `alias`, the generic
 //! fallback, interrupt source mapping, tick delivery per clock domain, the timer-deadline query.
 use emu_core::{ClockDomain, ClockTree};
-use esp_periph::{device_set, mmio, Device, DeviceSet, Dispatch, Gpio, I2s, Misc, RegRam, Systimer, TimerGroup, UsbSerialJtag, WriteEffect, NO_SOURCE};
+use esp_periph::{device_set, mmio, Device, DeviceSet, Dispatch, Gpio, I2s, Misc, RegRam, SpiMem, Systimer, TimerGroup, UsbSerialJtag, WriteEffect, NO_SOURCE};
 
 // ------------------------------------------------------------------ systimer
 #[test]
@@ -116,6 +116,55 @@ fn i2s_frame_rate_from_the_clock_registers() {
     assert_eq!(i.sample_rate, (160_000_000 + 9 * 128 / 2) / (9 * 128));
     Device::write(&mut i, 0x34, 8);                          // clock off: the last rate stays
     assert_eq!(i.derive_rate(), None);
+}
+
+// ------------------------------------------------------------------ SPI1: the octal PSRAM's mode registers
+/// MR`ma` and MR`ma+1`, read the way IDF v4.4.7 does it (opiram_psram.c:166-173: command 0x4040,
+/// 32 address bits, 16 data bits, CS1 alone), through the registers of IDF v4.4.7
+/// soc/esp32s3/include/soc/spi_mem_reg.h.
+fn psram_mr_read(s: &mut SpiMem, ma: u32) -> [u8; 2] {
+    s.write(0x34, 1);                     // SPI_MEM_MISC_REG: CS0_DIS (bit 0) set, CS1_DIS (bit 1) clear
+    s.write(0x18, 1 << 28);               // SPI_MEM_USER_REG: USR_MISO
+    s.write(0x1c, (32 - 1) << 26);        // SPI_MEM_USER1_REG: USR_ADDR_BITLEN
+    s.write(0x20, 0x4040);                // SPI_MEM_USER2_REG: USR_COMMAND_VALUE = OPI_PSRAM_REG_READ
+    s.write(0x28, 16 - 1);                // SPI_MEM_MISO_DLEN_REG
+    s.write(0x4, ma);                     // SPI_MEM_ADDR_REG
+    assert!(s.write(0x0, 1 << 18), "SPI_MEM_CMD_REG: USR starts the command");
+    s.execute(&mut [], &mut []);
+    let w0 = s.read(0x58);                // SPI_MEM_W0_REG
+    [w0 as u8, (w0 >> 8) as u8]
+}
+
+/// MR2's density field is the only thing IDF sizes the PSRAM by: 001/011/101/111 = 32/64/128/256
+/// Mbit (opiram_psram.c:264-267; APS12808L-OBMx Rev 3.0a Table 12), 4/8/16/32 MB by
+/// spiram.c:318-333. Device id 01 and good-die 1 of the reset value 0x8b stay as they are, and the
+/// size can go down again as well as up.
+#[test]
+fn opi_psram_mr2_density_follows_the_array_size() {
+    let mut s = SpiMem::new(true);
+    assert_eq!(psram_mr_read(&mut s, 2), [0x8b, 0x00], "reset value: 64 Mbit, MR3 after it");
+    for (bytes, mr2) in [(16 << 20, 0x8d), (32 << 20, 0x8f), (4 << 20, 0x89), (8 << 20, 0x8b), (16 << 20, 0x8d)] {
+        assert!(s.set_psram_size(bytes));
+        let [lo, hi] = psram_mr_read(&mut s, 2);
+        assert_eq!(lo, mr2, "MR2 for {} MB", bytes >> 20);
+        assert_eq!(hi, 0x00, "MR3 unchanged");
+        let mbit = match lo & 0x7 { 0x1 => 32, 0x3 => 64, 0x5 => 128, 0x7 => 256, _ => 0 };   // opiram_psram.c:264-267
+        assert_eq!(mbit << 17, bytes, "IDF's size is the array's");
+        assert_eq!((lo >> 3) & 0x3, 0b01, "dev id kept");
+        assert_eq!(lo >> 7, 1, "good-die kept");
+    }
+    assert_eq!(psram_mr_read(&mut s, 0), [0x09, 0x0d], "MR0 and MR1 untouched");
+}
+
+/// A size the field has no code for leaves MR2 as it was: the reset value's 64 Mbit.
+#[test]
+fn opi_psram_mr2_ignores_a_size_it_cannot_say() {
+    let mut s = SpiMem::new(true);
+    for bytes in [0, 2 << 20, 12 << 20, 64 << 20, (16 << 20) + 1] {
+        assert!(!s.set_psram_size(bytes), "{bytes} bytes");
+        assert_eq!(esp_periph::opi_psram_density(bytes), None);
+    }
+    assert_eq!(psram_mr_read(&mut s, 2)[0], 0x8b);
 }
 
 // ------------------------------------------------------------------ the table

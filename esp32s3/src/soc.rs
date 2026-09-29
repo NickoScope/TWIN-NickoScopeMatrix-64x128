@@ -128,6 +128,7 @@ impl esp_soc::SocBus for SocBus {
         p.efuse = old.efuse;
         p.misc.log_unknown = old.misc.log_unknown; p.spi1.log = old.spi1.log;
         p.spi0.jedec = old.spi0.jedec; p.spi1.jedec = old.spi1.jedec;   // the flash chip is not reset: its ID keeps the --flash-mb capacity
+        p.spi0.psram_mr[2] = old.spi0.psram_mr[2]; p.spi1.psram_mr[2] = old.spi1.psram_mr[2];   // nor the PSRAM: MR2 is read-only (APS12808L-OBMx Rev 3.0a §7.7) and keeps the --psram-mb density
         p.rtc.ram = old.rtc.ram; p.rtc.slow_ticks = old.rtc.slow_ticks;
         p.rtc.ram.write(0x38, cause | (cause << 6));
         p.rtc.ram.write(0x98, 0);                       // watchdog disarmed by the reset; the ROM re-arms it
@@ -217,7 +218,13 @@ impl esp_soc::SocBus for SocBus {
         let cap = bytes.trailing_zeros() as u8; self.periph.spi1.jedec[2] = cap; self.periph.spi0.jedec[2] = cap;
         self.rebuild_page_table();
     }
-    fn set_psram_size(&mut self, bytes: usize) -> Result<(), String> { self.psram = vec![0; bytes]; self.rebuild_page_table(); Ok(()) }
+    /// The array, and MR2's density with it: IDF sizes the PSRAM from MR2 alone (opiram_psram.c:264).
+    fn set_psram_size(&mut self, bytes: usize) -> Result<(), String> {
+        self.psram = vec![0; bytes];
+        self.periph.spi0.set_psram_size(bytes); self.periph.spi1.set_psram_size(bytes);
+        self.rebuild_page_table();
+        Ok(())
+    }
     /// `--strap`: the pins as the next boot latches them (the run's first boot takes all of it).
     fn set_strap(&mut self, v: u32) { self.periph.gpio.strap = v; self.strap_latched = v; }
     fn strap(&self) -> Option<u32> { Some(self.periph.gpio.strap) }
