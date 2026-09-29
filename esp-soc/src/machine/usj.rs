@@ -108,13 +108,16 @@ impl<S: Soc> Machine<S> {
                 PortIn::Lines { dtr, rts } => if self.usj_lines(dtr, rts) { break; },
                 PortIn::Close(id) => {
                     self.drain_console();                       // the session's last output
+                    // A host that goes away drops its lines: a chip held in reset runs again, and
+                    // the session still hears its `release`. (0, 0) never asks for a reset.
+                    self.usj_lines(false, false);
                     if self.usj_state.session == Some(id) {
                         eprintln!("[emu] usj: t={:.3}s port closed ({} bytes to the chip, {} from it)", self.seconds(), self.usj_state.bytes_in, self.usj_state.bytes_out);
+                        self.usj_event("{\"t\":\"closed\"}");
                         self.usj_state.session = None;
                         if let Some(w) = &self.web { w.send_text("{\"t\":\"usj\",\"claimed\":false}"); }
                     }
-                    // A host that goes away drops its lines: a chip held in reset runs again.
-                    if self.usj_lines(false, false) { break; }
+                    port.finish(id);
                 }
             }
         }

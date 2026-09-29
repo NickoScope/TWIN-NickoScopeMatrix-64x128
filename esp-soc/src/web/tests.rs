@@ -321,6 +321,8 @@ fn usj_lines_keep_their_place_among_the_bytes_and_close_releases() {
     assert!(c.upgrade("/usj?x=1").starts_with("HTTP/1.1 101"));
     c.socket.write_all(&client_frame(2, &[0x00, 0x41], true)).unwrap();    // data before any open
     assert_eq!(c.read_frame(), (2, b"\x10{\"t\":\"error\",\"error\":\"not open\"}".to_vec()));
+    c.socket.write_all(&client_frame(2, &[0x03], true)).unwrap();          // a close with nothing open
+    assert_eq!(c.read_frame(), (2, b"\x10{\"t\":\"closed\"}".to_vec()));
     let mut wire = client_frame(2, &[0x02], true);
     wire.extend(client_frame(2, &[0x00, 0xc0], true));
     wire.extend(client_frame(2, &[0x01, 0x01], true));                     // DTR
@@ -339,8 +341,13 @@ fn usj_lines_keep_their_place_among_the_bytes_and_close_releases() {
     assert_eq!(ev[1..], [PortIn::Data(vec![0xc0]), PortIn::Lines { dtr: true, rts: false }, PortIn::Data(vec![0xc1]),
                          PortIn::Lines { dtr: false, rts: true }, PortIn::Data(vec![0x01, 0x02, 0x03]), PortIn::Close(id)]);
     assert_eq!(c.read_frame(), (10, b"p".to_vec()));
-    assert_eq!(c.read_frame(), (2, b"\x10{\"t\":\"closed\"}".to_vec()));
     assert!(!port.held());
+    // What the machine says in answer to the frames before the close, then its `closed`, in order.
+    assert!(port.deliver(id, PortOut::Event("{\"t\":\"release\",\"strap\":15}".into())));
+    assert!(port.deliver(id, PortOut::Event("{\"t\":\"closed\"}".into())));
+    port.finish(id);
+    assert_eq!(c.read_frame(), (2, b"\x10{\"t\":\"release\",\"strap\":15}".to_vec()));
+    assert_eq!(c.read_frame(), (2, b"\x10{\"t\":\"closed\"}".to_vec()));
     // A close frame is answered with 1000.
     c.socket.write_all(&client_frame(8, &[0x03, 0xe8], true)).unwrap();
     assert_eq!(c.read_frame(), (8, vec![0x03, 0xe8]));

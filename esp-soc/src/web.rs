@@ -24,7 +24,8 @@
 //! once the machine has taken this connection's open (the port is open from here on; `reset`
 //! false means line resets are ignored by this run); `{"t":"error","error":"busy"}` when another
 //! client holds the port (the port stays closed for this connection); `{"t":"error","error":
-//! "not open"}` for data or lines before an open; `{"t":"closed"}` after a close;
+//! "not open"}` for data or lines before an open; `{"t":"closed"}` after a close, once the machine
+//! has applied everything sent before it (what the chip answered to that comes first);
 //! `{"t":"reset","cause":21,"download":true}` when RTS=1/DTR=0 begins (the chip is reset and held;
 //! `download` is the latched flag); `{"t":"release","strap":3}` when the pair leaves (1,0) (the
 //! chip runs; `strap` is GPIO_STRAPPING as its ROM reads it). Data and line frames are applied
@@ -335,14 +336,17 @@ fn handle_usj(stream: TcpStream, mut out: TcpStream, early: Vec<u8>, port: UsjPo
                         Err(Busy) => event(&tx, "{\"t\":\"error\",\"error\":\"busy\"}"),
                     }
                 }
-                (Some(0x03), _) => { if let Some(s) = session.take() { eprintln!("[emu] usj: session {} closed", s.id()); s.close(); } event(&tx, "{\"t\":\"closed\"}"); }
+                // `closed` comes from the machine once it has applied what came before the close
+                // (the chip's answers to it arrive first); without a session there is nothing to wait for.
+                (Some(0x03), Some(_)) => { if let Some(s) = session.take() { eprintln!("[emu] usj: session {} closed", s.id()); s.close(); } }
+                (Some(0x03), None) => event(&tx, "{\"t\":\"closed\"}"),
                 (t, _) => if !std::mem::replace(&mut unknown_logged, true) { eprintln!("[emu] usj: {peer}: unknown frame type {:?} ignored", t); },
             },
             _ => {}
         }
         true
     });
-    if let Some(s) = session.take() { eprintln!("[emu] usj: {peer} went away; session {} closed", s.id()); s.close(); }
+    if let Some(s) = session.take() { eprintln!("[emu] usj: {peer} went away; session {} closed", s.id()); s.abandon(); }
     if closing.is_some() { let _ = tx.send(frame(8, &[0x03, 0xe8])); }    // answer a close with 1000 (RFC 6455 §5.5.1)
     drop(tx);
     let _ = writer.join();

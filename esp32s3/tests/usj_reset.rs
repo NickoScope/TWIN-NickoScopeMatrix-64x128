@@ -124,6 +124,33 @@ fn the_host_going_away_or_the_page_reset_releases_a_held_chip() {
 }
 
 #[test]
+fn a_page_that_closes_hears_the_release_and_then_closed() {
+    let mut m = machine("none");
+    let (port, s, rx) = open(&mut m);
+    lines(&s, &[(0, 1)]);
+    expect_reset(&mut m);
+    assert!(matches!(run_ms(&mut m, 2), Stop::Halted));
+    let _ = events(&rx);
+    let id = s.id();
+    s.close();                                               // the page's 0x03 with the chip held
+    assert!(matches!(run_ms(&mut m, 2), Stop::Halted));
+    assert!(!m.usj_held());
+    assert_eq!(events(&rx), [r#"{"t":"release","strap":15}"#, r#"{"t":"closed"}"#]);
+    assert!(!port.deliver(id, PortOut::Data(vec![1])), "the machine is done with the session");
+
+    // esptool's hard reset: the lines let go, and the port closes right after.
+    let (_port, s, rx) = open(&mut m);
+    lines(&s, &[(0, 1)]);
+    expect_reset(&mut m);
+    lines(&s, &[(0, 0)]);
+    s.close();
+    assert!(matches!(run_ms(&mut m, 2), Stop::Halted));
+    let ev = events(&rx);
+    assert_eq!(ev[ev.len() - 2..], [r#"{"t":"release","strap":15}"#, r#"{"t":"closed"}"#]);
+    assert_eq!(m.usj_session(), None);
+}
+
+#[test]
 fn boot_strap_and_usb_reset_agree() {
     let mut m = machine("hub75-panel");
     let (_port, s, _rx) = open(&mut m);

@@ -269,7 +269,7 @@ pub fn serve(mut stream: TcpStream, usj: UsjPort) {
         }
     }
     eprintln!("[emu] rfc2217: {peer} closed the port after {n_in} bytes to the chip");
-    session.close();
+    session.abandon();                   // the client is gone: nobody reads what the chip says next
     drop(tx);
     let _ = stream.shutdown(std::net::Shutdown::Both);
     let _ = writer.join();
