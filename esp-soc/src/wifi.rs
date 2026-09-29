@@ -33,6 +33,37 @@ pub fn describe(f: &[u8]) -> String {
 
 /// True for a beacon frame (management subtype 8).
 pub fn is_beacon(f: &[u8]) -> bool { f.len() >= 2 && f[0] & 0x0c == 0 && (f[0] >> 4) & 0xf == 8 }
+/// True for a management frame (type 0): beacons, probe, auth and association exchanges.
+pub fn is_mgmt(f: &[u8]) -> bool { !f.is_empty() && f[0] & 0x0c == 0 }
+/// True for an EAPOL frame (a data frame whose LLC/SNAP header names 0x888e): the four-way handshake.
+pub fn is_eapol(f: &[u8]) -> bool {
+    if f.len() < 2 || f[0] & 0x0c != 0x08 { return false; }
+    let hdr = if (f[0] >> 4) & 8 != 0 { 26 } else { 24 };
+    f.len() >= hdr + 8 && f[hdr] == 0xaa && f[hdr + 6..hdr + 8] == [0x88, 0x8e]
+}
+/// Frames of the connect exchange: management frames other than beacons, and the handshake.
+fn is_control(f: &[u8]) -> bool { (is_mgmt(f) && !is_beacon(f)) || is_eapol(f) }
+
+/// The order frames that are due go on the air: the connect exchange first (management
+/// responses and the handshake must not wait behind anything), then the beacon, then data. A
+/// beacon behind queued data could wait for ever while a LAN keeps sending, and a station that
+/// hears no beacon for its inactive time drops the link (ESP-IDF `esp_wifi_set_inactive_time`:
+/// "Default 6s", Arduino-ESP32 2.0.17's SDK tools/sdk/esp32s3/include/esp_wifi/include/esp_wifi.h:1141-1142).
+pub fn air_order(a: &AirFrame) -> (u8, u64) {
+    (if is_control(&a.frame) { 0 } else if is_beacon(&a.frame) { 1 } else { 2 }, a.at_us)
+}
+
+/// How many frames may wait for the air, in the AP's queue and in front of it. Past this the
+/// oldest data frame goes (a LAN in bridge mode can send faster than the air delivers).
+pub const AIR_QUEUE_MAX: usize = 64;
+
+/// Append to a bounded frame queue, dropping the oldest when it is full; returns how many went.
+pub fn push_bounded(q: &mut Vec<Vec<u8>>, frames: impl IntoIterator<Item = Vec<u8>>, cap: usize) -> u64 {
+    q.extend(frames);
+    let over = q.len().saturating_sub(cap);
+    q.drain(..over);
+    over as u64
+}
 
 /// RSN information element advertised in beacons and echoed in handshake message 3: WPA2-PSK, CCMP.
 pub const RSN_IE: &[u8] = &[48, 20, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 2, 0, 0];
@@ -113,6 +144,8 @@ pub struct VirtualAp {
     pub log: bool,
     pub stats: (u64, u64, u64),   // beacons, probe responses, data frames from the station
     pub pn: u64,                  // CCMP packet number for frames we send
+    /// frames dropped from a full `queue` (`AIR_QUEUE_MAX`), data frames first
+    pub queue_dropped: u64,
 }
 
 impl VirtualAp {
@@ -126,7 +159,17 @@ impl VirtualAp {
             for i in 0..16 { wpa.gtk[i] = seed[(i + 3) % 20] ^ 0x5a; }
         }
         VirtualAp { cfg, wpa, state: StaState::Idle, sta: [0; 6], aid: 1, next_beacon_us: 100_000, beacon_interval_us: 102_400, seq: 0,
-                    queue: Vec::new(), pn: 0, log, stats: (0, 0, 0) }
+                    queue: Vec::new(), pn: 0, log, stats: (0, 0, 0), queue_dropped: 0 }
+    }
+    /// Put frames back on the queue (or on it for the first time), keeping it to `AIR_QUEUE_MAX`:
+    /// the oldest data frame goes first; a beacon or the connect exchange only if nothing else is left.
+    pub fn enqueue(&mut self, frames: impl IntoIterator<Item = AirFrame>) {
+        self.queue.extend(frames);
+        while self.queue.len() > AIR_QUEUE_MAX {
+            let i = self.queue.iter().position(|a| !is_mgmt(&a.frame) && !is_eapol(&a.frame)).unwrap_or(0);
+            self.queue.remove(i);
+            self.queue_dropped += 1;
+        }
     }
     fn hdr(&mut self, fc: u16, a1: &[u8; 6], a3: &[u8; 6]) -> Vec<u8> {
         let mut f = Vec::with_capacity(128);
@@ -156,16 +199,18 @@ impl VirtualAp {
     }
     fn send(&mut self, at_us: u64, frame: Vec<u8>) {
         if self.log { let d = describe(&frame); if d.contains("auth") || d.contains("assoc") || d.contains("888e") { eprintln!("[wifi] AP -> {}  hex={:02x?}", d, frame); } else { eprintln!("[wifi] AP -> {} (t+{} us)", d, at_us); } }
-        self.queue.push(AirFrame { at_us, frame });
+        self.enqueue([AirFrame { at_us, frame }]);
     }
     /// Time-driven behaviour (beacons). Returns frames due at or before `now_us`.
     pub fn step(&mut self, now_us: u64) -> Vec<AirFrame> {
-        let mgmt_pending = self.queue.iter().any(|a| !is_beacon(&a.frame));
+        // Only a pending management exchange (auth, association, probe response) holds the beacon
+        // back. Queued data must not: with a LAN behind the AP it may never drain.
+        let mgmt_pending = self.queue.iter().any(|a| is_mgmt(&a.frame) && !is_beacon(&a.frame));
         if now_us >= self.next_beacon_us && !mgmt_pending {
             self.next_beacon_us += self.beacon_interval_us;
             if self.next_beacon_us <= now_us { self.next_beacon_us = now_us + self.beacon_interval_us; }
             let b = self.beacon_like(8, &[0xff; 6], now_us); self.stats.0 += 1;
-            self.queue.push(AirFrame { at_us: now_us, frame: b });
+            self.enqueue([AirFrame { at_us: now_us, frame: b }]);
         }
         let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.queue).into_iter().partition(|a| a.at_us <= now_us);
         self.queue = later;

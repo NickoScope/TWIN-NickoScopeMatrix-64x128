@@ -11,6 +11,39 @@
 pub(crate) mod packet;
 use packet::{checksum, ethernet, ip_packet, transport_checksum, udp_packet, GATEWAY_MAC};
 
+/// The bridge to a real LAN (`--net bridge:PATH`, socket_vmnet). Unix sockets only: the
+/// WebAssembly build gets a stand-in whose `connect` explains that.
+#[cfg(unix)]
+pub mod vmnet;
+#[cfg(not(unix))]
+#[path = "net/vmnet_stub.rs"]
+pub mod vmnet;
+// The stand-in is compiled on the host too, so a change to one side that the other lacks shows up
+// in the tests rather than only in a WebAssembly build.
+#[cfg(all(test, unix))]
+#[path = "net/vmnet_stub.rs"]
+#[allow(dead_code)]
+mod vmnet_stub;
+
+/// The bridge's counters, printed at the end of a run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BridgeStats {
+    /// frames from the LAN handed to the station
+    pub rx_ok: u64,
+    /// frames from the LAN for someone else (the daemon floods every frame to every client)
+    pub rx_filtered: u64,
+    /// frames for the station dropped because the emulation had not taken the earlier ones yet
+    pub rx_dropped: u64,
+    /// frames written to the daemon
+    pub tx: u64,
+    /// frames from the station dropped: queue full, daemon gone, or a failed write
+    pub tx_dropped: u64,
+    pub reconnects: u64,
+}
+
+/// Frames the network may hand the station per poll in bridge mode; the rest wait in the bridge.
+pub const BRIDGE_BATCH: usize = 32;
+
 pub struct VirtualNet {
     pub gw_mac: [u8; 6],
     pub gw_ip: [u8; 4],
@@ -29,6 +62,11 @@ pub struct VirtualNet {
     pub arp_replies: u64,
     pub pings: u64,
     pub unhandled: u64,
+    /// `--net bridge:PATH`: the station's frames go to a real LAN as they are and the LAN's come
+    /// back; the DHCP server, ARP proxy, DNS, NTP, ICMP and NAT here stand aside
+    pub bridge: Option<vmnet::Bridge>,
+    /// frames for the station dropped because the queue in front of the air was full
+    pub eth_rx_dropped: u64,
     now_us: u64,
 }
 
@@ -41,13 +79,24 @@ impl VirtualNet {
     pub fn new(log: bool) -> Self {
         VirtualNet { gw_mac: GATEWAY_MAC, gw_ip: [10, 0, 2, 2], dns_ip: [10, 0, 2, 3],
                      sta_ip: [10, 0, 2, 15], mask: [255, 255, 255, 0],
-                     log, nat: None, lease: None, dhcp_acks: 0, dns_answers: 0, ntp_answers: 0, tcp_rejects: 0, arp_replies: 0, pings: 0, unhandled: 0, now_us: 0 }
+                     log, nat: None, lease: None, dhcp_acks: 0, dns_answers: 0, ntp_answers: 0, tcp_rejects: 0, arp_replies: 0, pings: 0, unhandled: 0,
+                     bridge: None, eth_rx_dropped: 0, now_us: 0 }
+    }
+
+    /// The end-of-run line for bridge mode, `None` otherwise.
+    pub fn bridge_report(&self) -> Option<String> {
+        let b = self.bridge.as_ref()?;
+        let s = b.stats();
+        Some(format!("[emu] bridge {}: rx_ok {}, rx_filtered {}, rx_dropped {}, tx {}, tx_dropped {}, reconnects {}; {} frames dropped before the air (station {})",
+                     b.path(), s.rx_ok, s.rx_filtered, s.rx_dropped, s.tx, s.tx_dropped, s.reconnects, self.eth_rx_dropped, crate::wifi::mac_str(&b.station())))
     }
 
     /// Handle one Ethernet frame from the station; returns frames to send back to it.
     pub fn handle(&mut self, eth: &[u8], now_us: u64) -> Vec<Vec<u8>> {
         if eth.len() < 14 { return Vec::new(); }
         self.now_us = now_us;
+        // bridged: the home router answers, not this network
+        if let Some(b) = &self.bridge { b.send(eth); return Vec::new(); }
         let mut src = [0u8; 6]; src.copy_from_slice(&eth[6..12]);
         match be16(&eth[12..14]) {
             0x0806 => self.arp(&eth[14..], &src),
@@ -184,6 +233,7 @@ impl VirtualNet {
     /// Pump the NAT's host sockets; returns frames for the guest.
     pub fn poll(&mut self, now_us: u64) -> Vec<Vec<u8>> {
         self.now_us = now_us;
+        if let Some(b) = &self.bridge { return b.recv(BRIDGE_BATCH); }
         match &mut self.nat { Some(n) => n.poll(now_us), None => Vec::new() }
     }
 
@@ -281,6 +331,50 @@ mod tests {
         let lease = crate::nat::Station { mac, ip: [10, 0, 2, 15], gateway: [10, 0, 2, 2] };
         assert_eq!(net.lease, Some(lease));
         assert_eq!(net.nat.as_ref().unwrap().station, Some(lease));
+    }
+
+    /// In bridge mode nothing here answers: the DHCP DISCOVER goes to the LAN unchanged, and what
+    /// the LAN sends back comes out of poll() a bounded batch at a time.
+    #[cfg(unix)]
+    #[test]
+    fn a_bridge_takes_the_frames_and_the_virtual_services_stand_aside() {
+        use std::io::{Read, Write};
+        let (ours, mut daemon) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mac = [0x02, 0x54, 0x57, 0x49, 0x4e, 0x01];
+        let mut net = VirtualNet::new(false);
+        net.bridge = Some(vmnet::Bridge::start(ours, "/nonexistent", mac, false).unwrap());
+        let mut d = vec![0u8; 240];
+        d[0] = 1; d[1] = 1; d[2] = 6;
+        d[28..34].copy_from_slice(&mac);
+        d[236..240].copy_from_slice(&[0x63, 0x82, 0x53, 0x63]);
+        d.extend_from_slice(&[53, 1, 1, 255]);                              // DISCOVER
+        let udp = udp_packet(&[0; 4], &[255; 4], 68, 67, &d);
+        let discover = ethernet(&[0xff; 6], &mac, 0x0800, &ip_packet(17, &[0; 4], &[255; 4], &udp));
+        assert!(net.handle(&discover, 0).is_empty());
+        let mut hdr = [0u8; 4];
+        daemon.read_exact(&mut hdr).unwrap();
+        let mut body = vec![0u8; u32::from_be_bytes(hdr) as usize];
+        daemon.read_exact(&mut body).unwrap();
+        assert_eq!(body, discover);
+        // ARP and ping for the virtual gateway go out too instead of being answered
+        let arp = ethernet(&[0xff; 6], &mac, 0x0806, &[0, 1, 8, 0, 6, 4, 0, 1, 2, 0x54, 0x57, 0x49, 0x4e, 1, 10, 0, 2, 15, 0, 0, 0, 0, 0, 0, 10, 0, 2, 2]);
+        assert!(net.handle(&arp, 0).is_empty());
+        assert_eq!((net.dhcp_acks, net.arp_replies, net.unhandled), (0, 0, 0));
+
+        for i in 0..BRIDGE_BATCH + 5 {
+            let f = ethernet(&mac, &[0x02, 1, 2, 3, 4, i as u8], 0x0800, &[0x45; 40]);
+            let mut w = (f.len() as u32).to_be_bytes().to_vec(); w.extend_from_slice(&f);
+            daemon.write_all(&w).unwrap();
+        }
+        let t = std::time::Instant::now();
+        while net.bridge.as_ref().unwrap().stats().rx_ok < BRIDGE_BATCH as u64 + 5 {
+            assert!(t.elapsed().as_secs() < 10, "the frames did not arrive");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(net.poll(0).len(), BRIDGE_BATCH);
+        assert_eq!(net.poll(0).len(), 5);
+        let r = net.bridge_report().unwrap();
+        assert!(r.contains("rx_ok 37") && r.contains("tx 2") && r.contains("reconnects 0"), "{r}");
     }
 
     #[test]

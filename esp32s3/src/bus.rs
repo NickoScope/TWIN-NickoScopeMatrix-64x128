@@ -565,12 +565,12 @@ impl SocBus {
         for e in eth_in { if let Some(f) = self.periph.wifi.ap.as_mut().unwrap().data_from_ds(&e) { due.push(crate::wifi::AirFrame { at_us: now_us, frame: f }); } }
         if due.is_empty() { return; }
         // management responses (auth, assoc, probe) go before beacons: a connect exchange must not be
-        // crowded out by beacon traffic
-        due.sort_by_key(|a| (crate::wifi::is_beacon(&a.frame), a.at_us));
+        // crowded out by beacon traffic; beacons go before data, which may never run dry
+        due.sort_by_key(crate::wifi::air_order);
         let first = due.remove(0);
         self.wifi_rx_deliver(&first.frame, now_us);
         self.periph.wifi.last_rx_us = now_us;
-        if let Some(ap) = &mut self.periph.wifi.ap { for a in due { ap.queue.push(a); } }
+        if let Some(ap) = &mut self.periph.wifi.ap { ap.enqueue(due); }
     }
 
     /// Write one received frame into the next RX descriptor (rx_ctrl header + frame + FCS) and raise the RX event.
@@ -869,7 +869,7 @@ impl SocBus {
                 let mut replies = Vec::new();
                 for e in out { replies.extend(net.handle(&e, now_us)); }
                 replies.extend(net.poll(now_us));
-                self.periph.wifi.eth_rx.extend(replies);
+                net.eth_rx_dropped += crate::wifi::push_bounded(&mut self.periph.wifi.eth_rx, replies, crate::wifi::AIR_QUEUE_MAX);
             }
         }
         if !self.periph.gpio.changes.is_empty() {

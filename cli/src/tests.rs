@@ -119,3 +119,28 @@ fn hostfwd_rules_are_repeatable() {
     assert_eq!(o.hostfwd, [esp_soc::nat::HostFwd { udp: false, host_port: 8080, guest_port: 80 },
                            esp_soc::nat::HostFwd { udp: true, host_port: 4210, guest_port: 4210 }]);
 }
+
+#[test]
+fn net_takes_nat_none_or_a_bridge_and_nothing_else() {
+    assert_eq!(net_mode("nat"), Ok(NetMode::Nat));
+    assert_eq!(net_mode("user"), Ok(NetMode::Nat));
+    assert_eq!(net_mode("none"), Ok(NetMode::None));
+    assert_eq!(net_mode("bridge:/var/run/socket_vmnet.bridged.en0"), Ok(NetMode::Bridge("/var/run/socket_vmnet.bridged.en0".into())));
+    for bad in ["", "tap", "bridge", "bridge:", "brige:/x", "NAT"] {
+        assert!(net_mode(bad).is_err(), "--net {bad:?} must be refused, not taken as none");
+    }
+    let args: Vec<String> = ["esp32sim", "--net", "bridge:/tmp/s"].iter().map(|s| s.to_string()).collect();
+    assert_eq!(parse(&args, "s3").net, NetMode::Bridge("/tmp/s".into()));
+    assert_eq!(parse(&["esp32sim".to_string()], "s3").net, NetMode::Nat);
+}
+
+#[test]
+fn a_bridge_needs_wifi_and_refuses_hostfwd() {
+    let opts = |a: &[&str]| { let v: Vec<String> = std::iter::once("esp32sim").chain(a.iter().copied()).map(String::from).collect(); parse(&v, "s3") };
+    assert!(check_net(&opts(&["--wifi", "ssid=x", "--net", "bridge:/tmp/s"])).is_ok());
+    assert!(check_net(&opts(&["--net", "bridge:/tmp/s"])).unwrap_err().contains("needs --wifi"));
+    let e = check_net(&opts(&["--wifi", "ssid=x", "--net", "bridge:/tmp/s", "--hostfwd", "tcp:8080-80"])).unwrap_err();
+    assert!(e.contains("--hostfwd") && e.contains("bridge"), "{e}");
+    assert!(check_net(&opts(&["--wifi", "ssid=x", "--net", "none", "--hostfwd", "tcp:8080-80"])).unwrap_err().contains("--net nat"));
+    assert!(check_net(&opts(&["--wifi", "ssid=x", "--hostfwd", "tcp:8080-80"])).is_ok());
+}

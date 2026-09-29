@@ -58,6 +58,31 @@ fn console_mask(name: &str) -> u32 {
     })
 }
 
+/// What `--net` puts behind the virtual access point.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum NetMode {
+    /// `nat` (or `user`): the virtual network, with TCP/UDP relayed through host sockets
+    #[default]
+    Nat,
+    /// `none`: the virtual network alone; traffic past the gateway is refused
+    None,
+    /// `bridge:PATH`: the station's frames go to a real LAN through the socket_vmnet daemon at PATH
+    Bridge(String),
+}
+
+/// `--net nat|user|none|bridge:PATH`. Anything else is an error, not quietly `none`.
+pub fn net_mode(v: &str) -> Result<NetMode, String> {
+    match v {
+        "nat" | "user" => Ok(NetMode::Nat),
+        "none" => Ok(NetMode::None),
+        _ => match v.strip_prefix("bridge:") {
+            Some(path) if !path.is_empty() => Ok(NetMode::Bridge(path.to_string())),
+            Some(_) => Err("--net bridge:PATH needs the socket_vmnet socket, e.g. bridge:/var/run/socket_vmnet.bridged.en0".into()),
+            None => Err(format!("--net {v}: expected nat, none or bridge:PATH")),
+        },
+    }
+}
+
 /// Everything the command line can say, chip-agnostic; `None` means "the chip's default".
 #[derive(Default)]
 pub struct Opts {
@@ -69,7 +94,7 @@ pub struct Opts {
     pub rom: Option<PathBuf>, pub bootloader: Option<String>, pub ptable: Option<String>, pub app: Option<String>, pub elfs: Vec<String>,
     pub flash_image: Option<String>, pub flash_at: Vec<String>, pub boot: Option<String>, pub flash_mb: Option<usize>, pub psram_mb: Option<usize>, pub flash_id: Option<[u8; 3]>, pub flash_persist: Option<String>, pub cpi: Option<(u32, u32)>, pub serial_hex: Vec<u8>,
     pub mac: Option<[u8; 6]>, pub strap: Option<u32>, pub reset_cause: Option<u32>, pub efuse_regs: Option<String>, pub regs_init: Option<String>,
-    pub board: String, pub wifi: Option<String>, pub net: String, pub hostfwd: Vec<esp_soc::nat::HostFwd>, pub cam_image: Option<String>, pub cam_fps: f64,
+    pub board: String, pub wifi: Option<String>, pub net: NetMode, pub hostfwd: Vec<esp_soc::nat::HostFwd>, pub cam_image: Option<String>, pub cam_fps: f64,
     pub spi2_timing: bool, pub measured_te: bool,
     pub max_insns: u64, pub max_seconds: Option<f64>, pub script: Option<String>, pub serial: Option<String>,
     pub console: Option<String>, pub console_prefix: bool, pub realtime: bool, pub web_port: Option<u16>, pub web_dir: Option<String>, pub no_reboot: bool,
@@ -83,7 +108,7 @@ pub struct Opts {
 }
 
 pub fn parse(args: &[String], default_chip: &str) -> Opts {
-    let mut o = Opts { chip: default_chip.to_string(), board: "atech14".into(), net: "nat".into(), cam_fps: 10.0, max_insns: u64::MAX, dump: true, regtrace_max: u64::MAX, stop_exc: u64::MAX, cooja_slice_us: 100, ..Default::default() };
+    let mut o = Opts { chip: default_chip.to_string(), board: "atech14".into(), net: NetMode::Nat, cam_fps: 10.0, max_insns: u64::MAX, dump: true, regtrace_max: u64::MAX, stop_exc: u64::MAX, cooja_slice_us: 100, ..Default::default() };
     let mut i = 1;
     while i < args.len() {
         let a = args[i].as_str();
@@ -116,7 +141,7 @@ pub fn parse(args: &[String], default_chip: &str) -> Opts {
             "--spi2-timing" => o.spi2_timing = true,
             "--measured-te" => o.measured_te = true,
             "--wifi" => o.wifi = Some(next()),
-            "--net" => o.net = next(),
+            "--net" => o.net = net_mode(&next()).unwrap_or_else(|e| usage_error(&e)),
             // A host port on 127.0.0.1 forwarded into the guest: tcp:8080-80, udp:4210-4210
             "--hostfwd" => o.hostfwd.push(esp_soc::nat::HostFwd::parse(&next()).unwrap_or_else(|e| usage_error(&format!("--hostfwd {e}")))),
             "--cam-image" => o.cam_image = Some(next()),
@@ -198,11 +223,42 @@ fn attach_hostfwd(nat: &mut esp_soc::nat::Nat, o: &Opts) {
     }
 }
 
-/// `--hostfwd` needs the network behind `--wifi` with the NAT in front of it.
-fn check_hostfwd(o: &Opts) {
-    if o.hostfwd.is_empty() { return; }
-    if o.wifi.is_none() { usage_error("--hostfwd needs --wifi: there is no network to forward into"); }
-    if !(o.net == "nat" || o.net == "user") { usage_error("--hostfwd needs --net nat"); }
+/// `--hostfwd` needs the network behind `--wifi` with the NAT in front of it; a bridge needs `--wifi`.
+fn check_net(o: &Opts) -> Result<(), String> {
+    if let NetMode::Bridge(path) = &o.net {
+        if o.wifi.is_none() { return Err(format!("--net bridge:{path} needs --wifi: the station reaches the LAN through the virtual access point")); }
+        if !o.hostfwd.is_empty() { return Err(format!("--hostfwd does not go with --net bridge:{path}: the guest has its own address on the LAN, reach it there")); }
+    }
+    if o.hostfwd.is_empty() { return Ok(()); }
+    if o.wifi.is_none() { return Err("--hostfwd needs --wifi: there is no network to forward into".into()); }
+    if o.net != NetMode::Nat { return Err("--hostfwd needs --net nat".into()); }
+    Ok(())
+}
+fn check_hostfwd(o: &Opts) { check_net(o).unwrap_or_else(|e| usage_error(&e)) }
+
+/// Put the chosen backend behind the virtual network: the NAT (with its forwarded ports), a bridge
+/// to the LAN, or nothing. Says what it did; a bridge that cannot connect ends the run.
+fn attach_net(net: &mut esp_soc::net::VirtualNet, o: &Opts, station: [u8; 6], log: bool) {
+    match &o.net {
+        NetMode::Nat => {
+            let mut nat = esp_soc::nat::Nat::new(log);
+            eprintln!("[emu] NAT to the host network enabled (DNS via {}.{}.{}.{})", nat.resolver[0], nat.resolver[1], nat.resolver[2], nat.resolver[3]);
+            attach_hostfwd(&mut nat, o);
+            net.nat = Some(nat);
+            eprintln!("[emu] virtual network: station {}.{}.{}.{}, gateway {}.{}.{}.{} (DHCP, ARP, ICMP, DNS, NTP)", net.sta_ip[0], net.sta_ip[1], net.sta_ip[2], net.sta_ip[3], net.gw_ip[0], net.gw_ip[1], net.gw_ip[2], net.gw_ip[3]);
+        }
+        NetMode::None => eprintln!("[emu] virtual network: station {}.{}.{}.{}, gateway {}.{}.{}.{} (DHCP, ARP, ICMP, DNS, NTP; nothing past the gateway)", net.sta_ip[0], net.sta_ip[1], net.sta_ip[2], net.sta_ip[3], net.gw_ip[0], net.gw_ip[1], net.gw_ip[2], net.gw_ip[3]),
+        NetMode::Bridge(path) => {
+            let b = esp_soc::net::vmnet::Bridge::connect(path, station, log).unwrap_or_else(|e| {
+                eprintln!("--net bridge: {e}");
+                eprintln!("  is the socket_vmnet daemon installed and running? (tools/twin/README.md in AnimatedPixelClock: \"В домашней сети\")");
+                std::process::exit(2)
+            });
+            eprintln!("[emu] bridge to the LAN through {}: the station's frames go out as they are, the LAN's router serves DHCP; frames for {}, broadcast and multicast come back",
+                      path, esp_soc::wifi::mac_str(&station));
+            net.bridge = Some(b);
+        }
+    }
 }
 
 pub fn run_cli(default_chip: &str) {
@@ -251,9 +307,13 @@ fn run_cooja(o: &mut Opts) {
     report(&mut m, o, match summary.stopped { Some(_) => Stop::Halted, None => Stop::MaxInsns }, dt);
 }
 
+/// The base MACs a run has without `--mac`; the WiFi station uses the base MAC.
+const S3_MAC: [u8; 6] = [0x44, 0x1b, 0xf6, 0x75, 0xdc, 0xe0];
+const C6_MAC: [u8; 6] = [0xdc, 0x1e, 0xd5, 0x6e, 0x8c, 0xdc];
+
 fn setup_s3(o: &Opts) -> esp32s3::Machine {
     check_hostfwd(o);
-    let mut m = esp32s3::machine(o.mac.unwrap_or([0x44, 0x1b, 0xf6, 0x75, 0xdc, 0xe0]));
+    let mut m = esp32s3::machine(o.mac.unwrap_or(S3_MAC));
     m.bus.board = esp32s3::board::make_board(&o.board).unwrap_or_else(|| { eprintln!("unknown board '{}' (atech14, waveshare-cam, waveshare-lcd4b, waveshare-amoled18-v2, hub75-panel, none)", o.board); std::process::exit(2) });
     if o.measured_te {
         assert_eq!(m.bus.board.name(), "waveshare-amoled18-v2", "--measured-te requires the AMOLED V2 board");
@@ -267,13 +327,7 @@ fn setup_s3(o: &Opts) -> esp32s3::Machine {
         eprintln!("[emu] virtual AP '{}' bssid {} channel {} ({})", cfg.ssid, esp32s3::wifi::mac_str(&cfg.bssid), cfg.channel, if cfg.psk.is_some() { "WPA2-PSK" } else { "open" });
         m.bus.periph.wifi.ap = Some(esp32s3::wifi::VirtualAp::new(cfg, m.bus.debug.has("wifi-frames")));
         let mut net = esp32s3::net::VirtualNet::new(m.bus.debug.has("net"));
-        if o.net == "nat" || o.net == "user" {
-            let mut nat = esp32s3::nat::Nat::new(m.bus.debug.has("net"));
-            eprintln!("[emu] NAT to the host network enabled (DNS via {}.{}.{}.{})", nat.resolver[0], nat.resolver[1], nat.resolver[2], nat.resolver[3]);
-            attach_hostfwd(&mut nat, o);
-            net.nat = Some(nat);
-        }
-        eprintln!("[emu] virtual network: station {}.{}.{}.{}, gateway {}.{}.{}.{} (DHCP, ARP, ICMP, DNS, NTP)", net.sta_ip[0], net.sta_ip[1], net.sta_ip[2], net.sta_ip[3], net.gw_ip[0], net.gw_ip[1], net.gw_ip[2], net.gw_ip[3]);
+        attach_net(&mut net, o, o.mac.unwrap_or(S3_MAC), m.bus.debug.has("net"));
         m.bus.periph.wifi.net = Some(net);
         m.bus.refresh_tick_budget();
     }
@@ -319,7 +373,7 @@ fn setup_c3(o: &Opts) -> esp32c3::Machine {
 
 fn setup_c6(o: &Opts) -> esp32c6::Machine {
     check_hostfwd(o);
-    let mut m = esp32c6::machine(o.mac.unwrap_or([0xdc, 0x1e, 0xd5, 0x6e, 0x8c, 0xdc]), o.flash_mb.unwrap_or(4) << 20);
+    let mut m = esp32c6::machine(o.mac.unwrap_or(C6_MAC), o.flash_mb.unwrap_or(4) << 20);
     m.bus.set_flash_size(o.flash_mb.unwrap_or(4) << 20);   // the JEDEC capacity follows the size
     if !o.debug.is_empty() { let mut f = esp_soc::DebugFlags::from_env(); for d in &o.debug { f.parse(d); } m.set_debug(&f); }
     let name = if o.board == "atech14" { "none" } else { o.board.as_str() };   // the S3 default means "bare module" here
@@ -329,12 +383,7 @@ fn setup_c6(o: &Opts) -> esp32c6::Machine {
         eprintln!("[emu] virtual AP '{}' bssid {} channel {} ({})", cfg.ssid, esp_soc::wifi::mac_str(&cfg.bssid), cfg.channel, if cfg.psk.is_some() { "WPA2-PSK" } else { "open" });
         m.bus.periph.wifi_mac.ap = Some(esp_soc::wifi::VirtualAp::new(cfg, m.bus.debug.has("wifi-frames")));
         let mut net = esp_soc::net::VirtualNet::new(m.bus.debug.has("net"));
-        if o.net == "nat" || o.net == "user" {
-            let mut nat = esp_soc::nat::Nat::new(m.bus.debug.has("net"));
-            attach_hostfwd(&mut nat, o);
-            net.nat = Some(nat);
-        }
-        eprintln!("[emu] virtual network: station {}.{}.{}.{}, gateway {}.{}.{}.{} (DHCP, ARP, ICMP, DNS, NTP)", net.sta_ip[0], net.sta_ip[1], net.sta_ip[2], net.sta_ip[3], net.gw_ip[0], net.gw_ip[1], net.gw_ip[2], net.gw_ip[3]);
+        attach_net(&mut net, o, o.mac.unwrap_or(C6_MAC), m.bus.debug.has("net"));
         m.bus.periph.wifi_mac.net = Some(net);
     }
     for (flag, on) in [("--cam-image", o.cam_image.is_some()), ("--psram-mb", o.psram_mb.is_some()), ("--efuse-regs", o.efuse_regs.is_some()), ("--regs-init", o.regs_init.is_some()), ("--regstat", o.regstat.is_some())] {
