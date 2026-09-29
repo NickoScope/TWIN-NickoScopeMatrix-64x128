@@ -73,6 +73,7 @@
   <h1>NickoScope <span>Twin</span></h1>
   <span class="chip"><i class="dot" id="conn"></i><span id="connText">connecting</span></span>
   <span class="chip" id="board">board —</span>
+  <a class="chip" id="portalLink" href="http://127.0.0.1:8080/" target="_blank" rel="noopener" title="The firmware's own web portal, forwarded from the twin's port 80 (twin.py run --http)">portal ↗</a>
   <div class="stats">
     <span>time <b id="stTime">—</b></span>
     <span>refresh windows/s <b id="stFps">—</b></span>
@@ -117,6 +118,14 @@
         <button id="boot" type="button" title="GPIO0 low while held, as the board's BOOT key">BOOT</button>
         <button id="rst" type="button" title="The board's RESET key: the chip restarts, the flash keeps everything">RESET</button>
       </div>
+    </section>
+    <section class="card">
+      <h2>Room · SHTC3</h2>
+      <div class="look" style="gap:12px">
+        <label>°C <input id="tC" type="range" min="10" max="35" step="0.5" value="22.5"><b id="tCv">22.5</b></label>
+        <label>%RH <input id="rh" type="range" min="10" max="90" step="1" value="45"><b id="rhv">45</b></label>
+      </div>
+      <p class="hint">The air at the board's sensor (I2C0 0x70). The firmware reads it for the weather clock and smooths it over a minute.</p>
     </section>
     <section class="card">
       <h2>Console · USB</h2>
@@ -205,7 +214,7 @@
     conBuf += s; if (conBuf.length > 60000) conBuf = conBuf.slice(-40000);
     const atEnd = con.scrollTop + con.clientHeight >= con.scrollHeight - 4;
     con.textContent = conBuf; if (atEnd) con.scrollTop = con.scrollHeight;
-    const m = /IP Address: ([0-9.]+)/.exec(s); if (m) $('portal').innerHTML = `The firmware got ${m[1]} on the virtual Wi-Fi. With <code>--hostfwd tcp:8080-80</code> its portal is <a href="http://127.0.0.1:8080/" target="_blank" rel="noopener">127.0.0.1:8080</a>.`;
+    const m = /IP Address: ([0-9.]+)/.exec(s); if (m) $('portal').innerHTML = `The firmware got ${m[1]} on the virtual Wi-Fi; its portal is forwarded to <a href="http://127.0.0.1:8080/" target="_blank" rel="noopener">127.0.0.1:8080</a>.`;
   }
   function connect() {
     ws = new WebSocket(`ws://${location.host}/ws`); ws.binaryType = 'arraybuffer';
@@ -257,6 +266,14 @@
     el.addEventListener('pointerdown', down); el.addEventListener('pointerup', up); el.addEventListener('pointerleave', up); el.addEventListener('pointercancel', up);
     remote.appendChild(el);
   }
+
+  // ---- the room at the SHTC3
+  const air = () => { $('tCv').textContent = $('tC').value; $('rhv').textContent = $('rh').value; send({ t: 'input', line: `climate ${$('tC').value} ${$('rh').value}` }); };
+  $('tC').addEventListener('change', air); $('rh').addEventListener('change', air);
+  $('tC').addEventListener('input', () => $('tCv').textContent = $('tC').value);
+  $('rh').addEventListener('input', () => $('rhv').textContent = $('rh').value);
+  // The portal link follows the host the page was opened on; the port is twin.py's --http (8080).
+  $('portalLink').href = `http://${location.hostname}:8080/`;
 
   // ---- the knob
   const knob = $('knob'); let angle = 0;
