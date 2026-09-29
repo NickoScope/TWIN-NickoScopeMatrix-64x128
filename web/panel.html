@@ -37,6 +37,7 @@
   .look { display: flex; gap: 18px; flex-wrap: wrap; align-items: center; font-size: 12px; color: var(--muted); }
   .look label { display: inline-flex; gap: 8px; align-items: center; }
   .look input[type=range] { width: 110px; accent-color: var(--amber); }
+  .look select { font: 12px var(--sans); color: var(--ink); background: #1c1f23; border: 1px solid var(--rule); border-radius: 6px; padding: 4px 6px; }
   .note { font-size: 12px; color: var(--muted); max-width: 70ch; }
   aside { display: flex; flex-direction: column; gap: 16px; }
   section.card { background: var(--bench); border: 1px solid var(--rule); border-radius: 10px; padding: 14px; }
@@ -85,6 +86,13 @@
       <label>Exposure <input id="exposure" type="range" min="0.25" max="4" step="0.05" value="1"></label>
       <label>GOB glow <input id="glow" type="range" min="0" max="1" step="0.05" value="0.55"></label>
       <label><input id="dots" type="checkbox" checked> LED dots</label>
+      <label>Seen by <select id="shutter">
+        <option value="eye">an eye (1/60 s)</option>
+        <option value="250">a camera, 1/250 s</option>
+        <option value="1000">a camera, 1/1000 s</option>
+        <option value="4000">a camera, 1/4000 s</option>
+        <option value="16000">a camera, 1/16000 s</option>
+      </select></label>
       <button id="snap" type="button">Save PNG</button>
     </div>
     <p class="note">Light is counted per LED from the HUB75 bitstream the firmware clocks out of LCD_CAM, over whole refreshes: 1.0 is an LED lit for its entire row slot of the 1/32 scan. Glow, dot size and exposure are a look, not yet calibrated against photos of the panel.</p>
@@ -186,6 +194,8 @@
   }
   requestAnimationFrame(draw);
   for (const id of ['exposure', 'glow', 'dots']) $(id).addEventListener('input', () => dirty = true);
+  // A short exposure catches only the rows the 1/32 scan lights meanwhile: the bands a phone films.
+  $('shutter').addEventListener('change', (e) => send({ t: 'input', line: 'shutter ' + e.target.value }));
   $('snap').addEventListener('click', () => { const a = document.createElement('a'); a.download = 'twin-panel.png'; a.href = canvas.toDataURL('image/png'); a.click(); });
 
   // ---- the emulator's WebSocket
