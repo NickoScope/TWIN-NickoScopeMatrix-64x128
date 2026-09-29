@@ -2,6 +2,9 @@
 pub use esp_periph::i2c::*;
 use std::collections::HashMap;
 
+mod shtc3;
+pub use shtc3::*;
+
 pub struct Ch32v003 { pub regs: [u8; 8], ptr: u8, first: bool, pub writes: u64 }
 impl Default for Ch32v003 { fn default() -> Self { Self::new() } }
 
