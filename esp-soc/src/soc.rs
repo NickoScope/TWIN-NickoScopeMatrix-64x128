@@ -109,6 +109,8 @@ pub trait SocBus: Bus {
     fn gpio_set_input(&mut self, pin: u8, level: bool);
     /// Deliver host touch at the bus's current time horizon.
     fn touch_input(&mut self, x: u16, y: u16, down: bool) { self.board().touch(x, y, down); }
+    /// A board input verb (`BoardModel::input_at`) at the bus's current time horizon.
+    fn board_input(&mut self, cmd: &str, args: &str) -> Result<(), String> { let c = self.cycles(); self.board().input_at(c, cmd, args) }
     fn gpio_input(&self) -> u64;
     /// Start/stop recording GPIO edges (outputs as they reach the board, inputs as they are set).
     fn observe_gpio(&mut self, on: bool);

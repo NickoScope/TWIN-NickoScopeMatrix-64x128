@@ -20,6 +20,8 @@ pub trait BoardModel {
     fn advance_to(&mut self, cycle: VirtualCycle)                    // advance through due transitions
     fn take_edges(&mut self) -> Vec<BoardEdge>                // timestamped GPIO input edges
     fn input_levels(&self) -> Vec<(u8, bool)>                  // current board-driven input levels
+    fn check_input(&self, cmd: &str, args: &str) -> Option<Result<(), String>>  // a board's own script/UI verb
+    fn input_at(&mut self, cycle: VirtualCycle, cmd: &str, args: &str) -> Result<(), String>
     fn named_pin(&self, name: &str) -> Option<u8>           // `btn1`, `sw`... for scripts and the UI
     fn encoder(&self) -> Option<(u8, u8)>                    // rotary encoder CLK/DT, for `knob`
     fn report(&self) -> String                               // end-of-run statistics
@@ -85,6 +87,29 @@ This model applies only to V2, which carries CO5300 and CST820. The V1 SH8601 an
 combination is not selected by this board name. It needs `--flash-mb 16 --psram-mb 8`.
 Board input edges retain their intended timestamps. The current fast scheduler applies them to
 the SoC at its next existing bus tick.
+
+## `hub75-panel` — NickoScope LED panel (Waveshare ESP32-S3 RGB matrix board), inputs only for now
+
+The panel's physical inputs as pin-level devices, so the firmware's own GPIO interrupt, timer and
+decoders read them as on hardware (`esp32s3/src/board/panel_inputs.rs`, where every timing names
+its source). The HUB75 display is not in this board yet: `hub75_panel_inputs_only.rs` is a
+temporary board that the display model replaces, embedding the same `PanelInputs`.
+
+| Device | Pins | Model |
+| --- | --- | --- |
+| TSOP2138 IR receiver + the owner's NEC remote | GPIO0, open drain, active low | NEC messages from IRremoteESP8266's `ir_NEC.h` (8960/4480 header, 560 marks, 1680/560 spaces, 32 bits MSB first, every message padded to 108,080 us; a held key sends 8960/2240/560 repeats each slot); the ten learned codes by function name, number or raw `0x` code; optional receiver delay and mark stretch (Vishay 82460 bounds 105–263 us, −79..+92 us) |
+| EC11 knob A / B | IO45 / IO46, active high (idle low, 10 k pull-downs) | quadrature at 3 ms a state, 12 ms between clicks; full-cycle or half-cycle detents |
+| Knob switch, BOOT | GPIO0, active low | timed or held presses |
+
+GPIO0 is the wired-AND of the receiver, the switch and BOOT. Script verbs (also the page's
+`{"t":"input","line":...}` message): `ir <key> [hold <ms>]`, `ir down <key>` / `ir up`,
+`ir tsop <delay_us> <stretch_us>`, `knob cw|ccw [n]`, `knob detent full|half`,
+`knob timing <state_ms> <gap_ms>`, `sw [ms]|down|up`, `boot [ms]|down|up`, and `press`/`release`
+of `sw`, `knob`, `boot`. `press 0` is refused; `gpio 0 <level>` still writes the pin raw until the
+next device edge. BOOT held through a reset does not select download mode here: the strap
+register is `--strap`. `tools/panel-inputs-oracle/` replays a run's `--vcd` edges through the
+firmware's own decoder sources built on the host (IRremoteESP8266 `decode()`, `ir_map.h`,
+`control.cpp`).
 
 ## `waveshare-c6-lcd147` — Waveshare ESP32-C6-LCD-1.47 (ESP32-C6)
 

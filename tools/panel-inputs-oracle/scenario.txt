@@ -1,0 +1,20 @@
+# hub75-panel inputs: every verb once, spaced so each gesture ends before the next
+1.0  ir ok
+2.0  ir cw
+2.5  ir ccw
+3.0  ir ok hold 1500
+5.0  ir long
+7.0  knob cw 3
+7.5  knob ccw 2
+8.0  sw 150
+9.0  boot 1200
+10.5 ir power
+11.0 ir tsop 263 92
+11.1 ir home
+11.5 ir cw hold 500
+12.5 ir 0x20DF10EF
+13.0 knob detent half
+13.1 knob cw 1
+13.6 knob ccw 1
+13.8 press knob 60
+14.0 stop

@@ -68,6 +68,12 @@ impl esp_soc::SocBus for SocBus {
         self.board.touch_at(self.cycles, x, y, down);
         if self.board.next_deadline().is_some() { self.refresh_tick_budget(); }
     }
+    fn board_input(&mut self, cmd: &str, args: &str) -> Result<(), String> {
+        let r = self.board.input_at(self.cycles, cmd, args);
+        // A new deadline bounds the device tick, so the first edge lands on its own cycle.
+        if self.board.next_deadline().is_some() { self.refresh_tick_budget(); }
+        r
+    }
     fn misc(&mut self) -> &mut Misc { &mut self.periph.misc }
     fn load_bytes(&mut self, addr: u32, data: &[u8]) -> Result<(), String> { SocBus::load_bytes(self, addr, data) }
     fn write_flash(&mut self, offset: usize, data: &[u8]) -> Result<(), String> {

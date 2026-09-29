@@ -7,10 +7,14 @@
 //! - `WaveshareCam` — ESP32-S3-CAM-OV5640
 //! - `WaveshareLcd4b` — ESP32-S3-Touch-LCD-4B
 //! - `WaveshareAmoled18V2` — ESP32-S3-Touch-AMOLED-1.8 V2
+//! - `PanelInputs` — the NickoScope LED panel's IR receiver, EC11 knob and BOOT, for the panel's board
+//! - `Hub75PanelInputsOnly` — TEMPORARY `hub75-panel`: those inputs and no display yet
 //! - `NoBoard` — a bare module: nothing on the pins (any ESP32-S3 firmware, console only)
 pub use esp_soc::board::{Board, BoardEdge, BoardModel, NoBoard, VirtualCycle};
 
 pub mod atech14;
+pub mod hub75_panel_inputs_only;   // TEMPORARY: replaced by the HUB75 board that embeds PanelInputs
+pub mod panel_inputs;
 pub mod waveshare_amoled18;
 pub mod waveshare_cam;
 pub mod waveshare_lcd4b;
@@ -28,6 +32,7 @@ pub fn make_board(name: &str) -> Option<Board> {
         "waveshare-cam" | "waveshare" => Some(Box::new(WaveshareCam::new())),
         "waveshare-lcd4b" | "lcd4b" => Some(Box::new(WaveshareLcd4b::new())),
         "waveshare-amoled18-v2" | "amoled18-v2" => Some(Box::new(WaveshareAmoled18V2::new())),
+        "hub75-panel" => Some(Box::new(hub75_panel_inputs_only::Hub75PanelInputsOnly::default())),   // TEMPORARY
         _ => None,
     }
 }

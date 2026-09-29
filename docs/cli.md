@@ -23,7 +23,7 @@ PSRAM and register presets.
 | `--serial TEXT` | bytes into the USB-Serial/JTAG console before the run |
 | `--elf F` (repeatable) | symbols for logs/profiles (app ELF, bootloader ELF) |
 | `--flash-mb N`, `--psram-mb N` | flash size (JEDEC follows it) and octal PSRAM size (default 8 / 2) |
-| `--board atech14\|waveshare-cam\|waveshare-lcd4b\|waveshare-amoled18-v2\|none` | board model (default atech14); on the C6: `waveshare-c6-lcd147` or `none` |
+| `--board atech14\|waveshare-cam\|waveshare-lcd4b\|waveshare-amoled18-v2\|hub75-panel\|none` | board model (default atech14); on the C6: `waveshare-c6-lcd147` or `none` |
 | `--strap HEX`, `--reset-cause HEX`, `--efuse-regs F`, `--regs-init F` | reproduce a real chip's boot state (used by the differential tests) |
 | `--no-reboot` | stop at the first chip reset instead of rebooting from ROM |
 | `--flash-at OFFSET=FILE` (repeatable) | write a file into flash at a hex offset — a data partition's contents (the panel's `demo` partition takes `energydata.json`) |
@@ -97,6 +97,15 @@ One action per line, `<seconds> <cmd> [args]`; buttons/encoder are active low.
 4.2  uart0 root              # a line into UART0's receive FIFO (also `uart1`): a login on a Linux console
 4.5  touch 450 30 1        # touch panel press at (450,30); `touch x y 0` releases
 5.5  stop
+```
+
+A board may add verbs of its own, and take over `press` or `knob` for pins it models itself;
+`hub75-panel` does, for its IR remote, knob and BOOT on GPIO0 ([boards](boards.md#hub75-panel)):
+
+```
+2.0  ir ok                 # a remote key: one NEC message on GPIO0 (`ir ok hold 800` repeats while held)
+4.0  knob cw 2             # 2 clicks on IO45/IO46, active high, 3 ms a state
+5.0  sw 150                # the knob's switch (also `boot 150`, `press sw 150`)
 ```
 
 `hw/wsdrive.py [port] [seconds]` drives the same inputs over the UI's WebSocket and reports

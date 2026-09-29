@@ -123,6 +123,21 @@ impl<S: Soc> Machine<S> {
             match t.as_str() {
                 "btn" => { let pin: u8 = field("pin").and_then(|x| x.parse().ok()).unwrap_or(0); let v = field("v").unwrap_or_default() == "1";
                            self.bus.gpio_set_input(pin, !v); *self.bus.irq_dirty() = true; }
+                // A board's own input verb, the same text a script line takes after its time
+                // (`ir down ok`, `sw up`); anything the board does not accept is dropped.
+                "input" => {
+                    let line = field("line").unwrap_or_default();
+                    let (cmd, args) = line.trim().split_once(char::is_whitespace).unwrap_or((line.trim(), ""));
+                    if let Some(Ok(())) = self.bus.board_ref().check_input(cmd, args.trim()) { let _ = self.bus.board_input(cmd, args.trim()); }
+                }
+                // Boards that model their knob take the page's knob messages as verbs.
+                "knobpress" if self.bus.board_ref().check_input("sw", "down").is_some() => {
+                    let _ = self.bus.board_input("sw", if field("v").unwrap_or_default() == "1" { "down" } else { "up" });
+                }
+                "knob" if self.bus.board_ref().check_input("knob", "cw").is_some() => {
+                    let d = field("d").and_then(|x| x.parse::<i32>().ok()).unwrap_or(1).clamp(-64, 64);
+                    if d != 0 { let _ = self.bus.board_input("knob", &format!("{} {}", if d > 0 { "cw" } else { "ccw" }, d.unsigned_abs())); }
+                }
                 "knobpress" => { let v = field("v").unwrap_or_default() == "1"; if let Some(sw) = self.bus.board_ref().named_pin("sw") { self.bus.gpio_set_input(sw, !v); *self.bus.irq_dirty() = true; } }
                 "knob" => {
                     // Bound each browser message to about one second of encoder motion.
