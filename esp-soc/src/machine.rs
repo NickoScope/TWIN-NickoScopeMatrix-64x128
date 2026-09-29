@@ -11,6 +11,7 @@ use emu_core::{Bus, Core, CostModel, LifecycleFacts, LifecycleKind, MemoryAccess
 use std::collections::{BTreeMap, HashMap};
 
 mod modeled;
+mod pace;
 mod usj;
 mod web;
 
@@ -42,10 +43,17 @@ pub struct Script { pub events: Vec<(u64, ScriptAction)>, pub pos: usize, pub lo
 
 pub struct Realtime {
     pub enabled: bool,
-    wall_start: Option<std::time::Instant>,
+    pace: pace::Pace,
     last_check: u64,
     pub behind: f64,
+    /// Times emulated time was given up to the host's clock (`pace::Step::Stalled`, `GiveUp`,
+    /// `HostSlept`): each one leaves the chip's clock of day that much behind the world until its
+    /// firmware next sets it (NTP).
     pub resyncs: u64,
+    /// Seconds of emulated time given up so far.
+    pub given_up: f64,
+    /// `--debug rt`: the lag in progress, as (emulated second it began, worst lag in seconds).
+    episode: Option<(f64, f64)>,
     /// Emulated seconds per wall second over the last second or more; `None` until measured.
     /// Unlike `behind`, a resynchronisation does not reset it, so it shows a run that cannot keep up.
     pub speed: Option<f64>,
@@ -163,7 +171,7 @@ impl<S: Soc> Machine<S> {
             script: Script { events: Vec::new(), pos: 0, log: true, knob_next: 0 }, max_cycles: u64::MAX,
             console: Console { all: Vec::new(), usb: Vec::new(), uart0: Vec::new(), mask: 3, prefix: false, capture: false },
             web: None, ws: WebState { last_push_cycles: 0, push_interval: 0, audio_sent: 0, ring_updates: 0, grid_updates: Vec::new(), px_pending: 0, px_sent: 0, px_deferred: false, cam_pushed: u64::MAX, cam_sent: false },
-            rt: Realtime { enabled: false, wall_start: None, last_check: 0, behind: 0.0, resyncs: 0, speed: None, speed_mark: None, log: false, log_last: None, log_insns: (0, 0) },
+            rt: Realtime { enabled: false, pace: pace::Pace::default(), last_check: 0, behind: 0.0, resyncs: 0, given_up: 0.0, episode: None, speed: None, speed_mark: None, log: false, log_last: None, log_insns: (0, 0) },
             debug_rom: false, cost: None, model_accesses: Vec::new(), approximate_jit_timing: None, approximate_cpi_frac: 0, approximate_cpi_acc: 0, approximate_jit_frontiers: false, model_ready_at: vec![0; S::CORES], model_stop: None, model_attach_error: None,
             usj: None, usj_reset: false, usj_state: usj::UsjState::default(),
         }
@@ -1064,32 +1072,52 @@ impl<S: Soc> Machine<S> {
         if self.bus.cycles().wrapping_sub(self.ws.last_push_cycles) >= self.ws.push_interval { self.ws.last_push_cycles = self.bus.cycles(); self.web_push(); self.web_poll_input(); }
     }
 
-    /// EX168 s4: the real-time pacing clock, out of line.
+    /// EX168 s4: the real-time pacing clock, out of line. What it decides is `pace::Pace::check`'s.
     #[cold]
     #[inline(never)]
     fn rt_pace(&mut self) {
-        {
-            self.rt.last_check = self.bus.cycles();
-            let start = *self.rt.wall_start.get_or_insert_with(std::time::Instant::now);
-            let emulated = std::time::Duration::from_secs_f64(self.bus.cycles() as f64 / S::CPU_HZ as f64);
-            let wall = start.elapsed();
-            let (now, cycles) = (std::time::Instant::now(), self.bus.cycles());
-            match self.rt.speed_mark {
-                Some((at, from)) if cycles >= from && now.duration_since(at) >= std::time::Duration::from_secs(1) => {
-                    self.rt.speed = Some((cycles - from) as f64 / S::CPU_HZ as f64 / now.duration_since(at).as_secs_f64());
-                    self.rt.speed_mark = Some((now, cycles));
-                }
-                Some((_, from)) if cycles < from => self.rt.speed_mark = Some((now, cycles)),   // the count restarted
-                None => self.rt.speed_mark = Some((now, cycles)),
-                _ => {}
+        self.rt.last_check = self.bus.cycles();
+        let (now, cycles) = (std::time::Instant::now(), self.bus.cycles());
+        let emulated = std::time::Duration::from_secs_f64(cycles as f64 / S::CPU_HZ as f64);
+        match self.rt.speed_mark {
+            Some((at, from)) if cycles >= from && now.duration_since(at) >= std::time::Duration::from_secs(1) => {
+                self.rt.speed = Some((cycles - from) as f64 / S::CPU_HZ as f64 / now.duration_since(at).as_secs_f64());
+                self.rt.speed_mark = Some((now, cycles));
             }
-            if emulated > wall + std::time::Duration::from_millis(2) { std::thread::sleep(emulated - wall); self.rt.behind = 0.0; }
-            else if wall > emulated + std::time::Duration::from_millis(50) {
-                self.rt.behind = (wall - emulated).as_secs_f64();
-                // more than half a second behind: resynchronise (skip the lag) rather than flood the client while catching up
-                if wall > emulated + std::time::Duration::from_millis(500) { self.rt.resyncs += 1; self.rt.wall_start = Some(std::time::Instant::now() - emulated); }
-            } else { self.rt.behind = 0.0; }
+            Some((_, from)) if cycles < from => self.rt.speed_mark = Some((now, cycles)),   // the count restarted
+            None => self.rt.speed_mark = Some((now, cycles)),
+            _ => {}
         }
+        let t = emulated.as_secs_f64();
+        match self.rt.pace.check(now, std::time::SystemTime::now(), emulated) {
+            pace::Step::Run => {}
+            pace::Step::Sleep(d) => std::thread::sleep(d),
+            pace::Step::Stalled(d) => self.rt_gave_up(t, d, &format!("the engine did not run for {:.1} s (the process was stopped or held)", d.as_secs_f64())),
+            pace::Step::GiveUp(d) => self.rt_gave_up(t, d, &format!("{:.1} s behind the host's clock: it cannot keep up", d.as_secs_f64())),
+            pace::Step::HostSlept(d) => self.rt_gave_up(t, d, &format!("the host slept {:.1} s and the chip stood still meanwhile", d.as_secs_f64())),
+        }
+        let lag = self.rt.pace.lag().as_secs_f64();
+        self.rt.behind = if lag > 0.05 { lag } else { 0.0 };
+        // `--debug rt`: one line a lag, from passing 50 ms until it is repaid to within 5 ms.
+        if self.rt.log {
+            match self.rt.episode {
+                None if lag > 0.05 => self.rt.episode = Some((t, lag)),
+                Some((from, worst)) if lag > 0.005 => self.rt.episode = Some((from, worst.max(lag))),
+                Some((from, worst)) => { eprintln!("[rt] t={:.2}s caught up: fell up to {:.0} ms behind from t={:.2}s", t, worst * 1e3, from); self.rt.episode = None; }
+                None => {}
+            }
+        }
+    }
+
+    /// Emulated time given up to the host's clock (`pace::Step`): counted, and said on stderr,
+    /// because the firmware's clock of day now trails the world by that much more.
+    #[cold]
+    fn rt_gave_up(&mut self, t: f64, d: std::time::Duration, why: &str) {
+        self.rt.resyncs += 1;
+        self.rt.given_up += d.as_secs_f64();
+        self.rt.episode = None;   // reported here, not as caught up
+        eprintln!("[emu] real time: t={:.3}s {}: {:.1} s given up, the chip's clock now trails the world by that much more until it next syncs ({} given up, {:.1} s in all)",
+                  t, why, d.as_secs_f64(), self.rt.resyncs, self.rt.given_up);
     }
 
     /// One encoder detent as (pin, level) edges, 2 ms apart. Idle is (1,1); CW: CLK falls while
