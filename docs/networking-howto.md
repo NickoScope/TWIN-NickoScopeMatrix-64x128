@@ -59,9 +59,12 @@ and the NAT (`--net nat`, the default).
 - **TCP.** Each accepted connection is opened toward the guest from the gateway, 10.0.2.2, with a
   port from 49152 up, so the firmware sees every client as 10.0.2.2. From the handshake on it is the
   same relay as an outbound connection. A guest port nobody listens on answers with a reset, and the
-  host client sees the connection closed without data (`curl: (52) Empty reply from server`) — which
-  is also what happens in the seconds between the lease and the firmware starting its server. A SYN
-  the guest does not answer for 30 s of emulated time gives up the same way.
+  host connection is closed at once. The relay closes the host socket rather than resetting it;
+  the host kernel turns that close into a reset when the client's request is still unread (RFC 2525
+  section 2.17), so curl reports `(56) Recv failure: Connection reset by peer`, and a client that
+  sent nothing yet sees end of file. The same happens in the seconds between the lease and the
+  firmware starting its server, when a SYN goes unanswered for 30 s of emulated time, and when the
+  guest resets a connection later on.
 - **Several connections** are fine, up to the NAT's 64 flows shared with outbound traffic; beyond
   that, new ones wait in the backlog until a flow ends. A server that handles one client at a time
   (Arduino `WebServer`) serves parallel requests one after another.
