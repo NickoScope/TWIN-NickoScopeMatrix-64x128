@@ -84,7 +84,9 @@ impl<S: Soc> Machine<S> {
 
     /// Take what clients did since the last call and apply it in order; send the device's
     /// output to the client holding the port. Called at run entry, with the page's input, and
-    /// from the scheduling rounds (`after_round_rest`) at the poll rate.
+    /// from the scheduling rounds (`after_round_rest`) at the poll rate. Out of line: the round's
+    /// own cost stays one compare.
+    #[inline(never)]
     pub(super) fn usj_service(&mut self) {
         let Some(port) = self.usj.clone() else { return };
         self.usj_state.pending.extend(port.poll());
