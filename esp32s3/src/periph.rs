@@ -19,6 +19,7 @@ pub const SRC_SPI2: usize = 21;
 pub const SRC_PCNT: usize = 41;
 pub const SRC_AES: usize = 77;
 pub const SRC_LCD_CAM: usize = 24;
+pub const SRC_SDIO_HOST: usize = 30;   // ETS_SDIO_HOST_INTR_SOURCE (soc/esp32s3/include/soc/interrupts.h: LCD_CAM 24 .. UART2 29, SDIO_HOST next)
 pub const SRC_I2S0: usize = 25;
 pub const SRC_I2S1: usize = 26;
 pub const SRC_RMT: usize = 40;
@@ -222,15 +223,33 @@ impl Pcnt {
 pub struct LcdCam { pub ram: RegRam, pub cam_ctrl: u32, pub cam_ctrl1: u32, pub int_raw: u32, pub int_ena: u32, pub running: bool,
                     pub frame_cycles: u64, pub acc: u64, pub frames: u64, pub dropped: u64,
                     // LCD side (RGB / DPI mode): the panel is refreshed from a GDMA out-channel on trigger 5
-                    pub lcd_clock: u32, pub lcd_user: u32, pub lcd_ctrl: u32, pub lcd_ctrl1: u32, pub lcd_acc: u64, pub lcd_frames: u64, pub lcd_line: Vec<u8>, pub lcd_fifo: std::collections::VecDeque<u8>, pub lcd_log: bool }
+                    pub lcd_clock: u32, pub lcd_user: u32, pub lcd_ctrl: u32, pub lcd_ctrl1: u32, pub lcd_acc: u64, pub lcd_frames: u64, pub lcd_line: Vec<u8>, pub lcd_fifo: std::collections::VecDeque<u8>, pub lcd_log: bool,
+                    // LCD side, i8080 mode with LCD_ALWAYS_OUT_EN: one bus word per PCLK for as long as the
+                    // GDMA out-channel on trigger 5 feeds it (a HUB75 panel's looping descriptor chain)
+                    pub i80_frac: u64, pub i80_pending: u64, pub i80_words: u64, pub i80_buf: Vec<u8> }
 impl Default for LcdCam { fn default() -> Self { Self::new() } }
 
 impl LcdCam {
     pub fn new() -> Self { LcdCam { ram: RegRam::new(), cam_ctrl: 0, cam_ctrl1: 0, int_raw: 0, int_ena: 0, running: false, frame_cycles: CPU_HZ / 10, acc: 0, frames: 0, dropped: 0,
-                                    lcd_clock: 0, lcd_user: 0, lcd_ctrl: 0, lcd_ctrl1: 0, lcd_acc: 0, lcd_frames: 0, lcd_line: Vec::new(), lcd_fifo: std::collections::VecDeque::new(), lcd_log: false } }
+                                    lcd_clock: 0, lcd_user: 0, lcd_ctrl: 0, lcd_ctrl1: 0, lcd_acc: 0, lcd_frames: 0, lcd_line: Vec::new(), lcd_fifo: std::collections::VecDeque::new(), lcd_log: false,
+                                    i80_frac: 0, i80_pending: 0, i80_words: 0, i80_buf: Vec::new() } }
     pub fn irq(&self) -> bool { self.int_raw & self.int_ena != 0 }
     /// LCD RGB mode running: LCD_START (USER bit 27) with LCD_RGB_MODE_EN (CTRL bit 31).
     pub fn lcd_running(&self) -> bool { self.lcd_user & (1 << 27) != 0 && self.lcd_ctrl & (1 << 31) != 0 }
+    /// LCD i8080 mode running: LCD_START with LCD_RGB_MODE_EN clear.
+    pub fn lcd_i8080_running(&self) -> bool { self.lcd_user & (1 << 27) != 0 && self.lcd_ctrl & (1 << 31) == 0 }
+    /// Bytes per i8080 bus word: LCD_2BYTE_EN (USER bit 23) selects a 16-bit bus.
+    pub fn lcd_bus_bytes(&self) -> usize { if self.lcd_user & (1 << 23) != 0 { 2 } else { 1 } }
+    /// The pixel clock in Hz: source / (DIV_NUM + DIV_B/DIV_A), then / (CLKCNT_N + 1) unless
+    /// CLK_EQU_SYSCLK (TRM, LCD_CAM clock). The HUB75 driver sets PLL_F160M, DIV_NUM 16 and
+    /// CLK_EQU_SYSCLK: 10 MHz (gdma_lcd_parallel16.cpp).
+    pub fn lcd_pclk_hz(&self) -> u64 {
+        let src = match (self.lcd_clock >> 29) & 3 { 1 => 40_000_000f64, 2 => 240_000_000.0, _ => 160_000_000.0 };
+        let div_num = ((self.lcd_clock >> 9) & 0xff).max(1) as f64; let div_b = ((self.lcd_clock >> 17) & 0x3f) as f64; let div_a = ((self.lcd_clock >> 23) & 0x3f) as f64;
+        let lcd_clk = src / (div_num + if div_a > 0.0 { div_b / div_a } else { 0.0 });
+        let n = if self.lcd_clock & (1 << 6) != 0 { 1.0 } else { (self.lcd_clock & 0x3f) as f64 + 1.0 };
+        (lcd_clk / n).max(1.0) as u64
+    }
     /// (active width, active height, bytes per pixel, CPU cycles per frame) from the timing registers.
     pub fn lcd_geometry(&self) -> (u32, u32, u32, u64) {
         // the registers hold (value - 1): lcd_ll_set_horizontal/vertical_timing
@@ -376,6 +395,51 @@ impl Device for FeIq {
     fn write(&mut self, _off: u32, v: u32) -> WriteEffect { self.word = v; WriteEffect::NONE }
 }
 
+/// SD/MMC host (DesignWare, soc/esp32s3/register/soc/sdmmc_struct.h) with an empty card slot:
+/// resets and clock updates complete at once, a command is sent and done, and a command that
+/// expects a response times out (RINTSTS.RTO), as with no card in the socket. The IDF driver then
+/// fails `sdmmc_card_init` with a timeout and the firmware carries on without a card, instead of
+/// spinning forever in `sdmmc_host_reset` on reset bits no hardware clears.
+pub struct Sdmmc { pub ram: RegRam, pub rintsts: u32, pub cmds: u64 }
+impl Sdmmc {
+    pub fn new() -> Self { Sdmmc { ram: RegRam::new(), rintsts: 0, cmds: 0 } }
+    fn int_on(&self) -> bool { self.ram.read(0x00) & (1 << 4) != 0 }               // CTRL.int_enable
+    pub fn irq(&self) -> bool { self.int_on() && self.rintsts & self.ram.read(0x24) != 0 }   // RINTSTS & INTMASK
+}
+impl Default for Sdmmc { fn default() -> Self { Self::new() } }
+impl Device for Sdmmc {
+    fn read(&mut self, off: u32) -> u32 {
+        match off {
+            0x00 => self.ram.read(0x00) & !0x7,                    // CTRL: controller/fifo/dma reset done
+            0x2c => self.ram.read(0x2c) & !(1 << 31),             // CMD: start_command taken
+            0x30..=0x3c => 0,                                      // RESP0..3: nothing answered
+            0x40 => if self.int_on() { self.rintsts & self.ram.read(0x24) } else { 0 },   // MINTSTS
+            0x44 => self.rintsts,                                  // RINTSTS
+            0x48 => 1 << 2,                                        // STATUS: FIFO empty, FSMs idle, no card on DAT3
+            0x50 => 0x3,                                           // CDETECT, active low: no card in slot 0 or 1
+            0x80 => self.ram.read(0x80) & !1,                      // BMOD: IDMAC software reset done
+            0x8c => 0,                                             // IDSTS
+            _ => self.ram.read(off),
+        }
+    }
+    fn write(&mut self, off: u32, v: u32) -> WriteEffect {
+        match off {
+            0x44 => self.rintsts &= !v,                            // write 1 to clear
+            0x2c => {
+                self.ram.write(0x2c, v);
+                if v & (1 << 31) != 0 && v & (1 << 21) == 0 {     // start_command, not update_clk_reg
+                    self.cmds += 1;
+                    self.rintsts |= 1 << 2;                        // cmd_done
+                    if v & (1 << 6) != 0 { self.rintsts |= 1 << 8; }   // response_expect: RTO
+                }
+            }
+            _ => self.ram.write(off, v),
+        }
+        WriteEffect::NONE
+    }
+    fn irq_sources(&self) -> u64 { self.irq() as u64 }
+}
+
 // ------------------------------------------------------------------ all together
 pub struct Peripherals {
     pub usb: UsbSerialJtag,
@@ -392,6 +456,7 @@ pub struct Peripherals {
     pub spi1: SpiMem,
     pub i2c: [crate::i2c::I2c; 2],
     pub lcd_cam: LcdCam,
+    pub sdmmc: Sdmmc,
     pub spi2: GpSpi,
     pub pcnt: Pcnt,
     pub wifi: WifiMac,
@@ -445,6 +510,7 @@ device_set! { Peripherals; clock: (clock) CPU_HZ, [(ClockDomain::Systimer, 15), 
     0x13 "I2C0" (i2c[0]) => [SRC_I2C0];
     0x27 "I2C1" (i2c[1]) => [SRC_I2C1];
     0x41 "LCD_CAM" (lcd_cam) => [SRC_LCD_CAM];
+    0x28 "SDMMC" (sdmmc) => [SRC_SDIO_HOST];
     0x24 "SPI2" (spi2) => [SRC_SPI2];
     0x17 "PCNT" (pcnt) => [SRC_PCNT];
     0x33 "WIFI_MAC" (wifi) => [SRC_WIFI_MAC];
@@ -469,7 +535,9 @@ impl DeviceSet for Peripherals {
         match block {
             0xc2 if !write => self.intmatrix.status = self.source_status(),   // INTERRUPT_*_STATUS reads the live sources
             0x35 => self.wifi.now_cycles = self.clock.cycles(),               // TSF timestamps
-            0x06 => self.fe.done = self.wifi.ap.is_some(),                    // IQ estimation completes once there is an AP
+            // IQ estimation is a calibration of the radio itself: silicon completes it with no AP in
+            // range too (a panel with no network configured still boots into its setup portal).
+            0x06 => self.fe.done = true,
             _ => {}
         }
     }
@@ -481,7 +549,7 @@ impl Peripherals {
             usb: UsbSerialJtag::new(CPU_HZ), uart: [Uart::new(UartLayout::S3), Uart::new(UartLayout::S3), Uart::new(UartLayout::S3)], systimer: Systimer::new(),
             timg: [TimerGroup::new(), TimerGroup::new()], intmatrix: IntMatrix::new(), gpio: Gpio::new(), rtc: RtcCntl::new(),
             efuse: Efuse::new(mac), system: SystemRegs::new(0x30), extmem: Extmem::new(), spi0: SpiMem::new(false), spi1: SpiMem::new(true),
-            i2c: [crate::i2c::I2c::new(), crate::i2c::I2c::new()], lcd_cam: LcdCam::new(), spi2: GpSpi::new(), pcnt: Pcnt::new(), wifi: WifiMac::new(), fe: FeIq { word: 0, done: false },
+            i2c: [crate::i2c::I2c::new(), crate::i2c::I2c::new()], lcd_cam: LcdCam::new(), sdmmc: Sdmmc::new(), spi2: GpSpi::new(), pcnt: Pcnt::new(), wifi: WifiMac::new(), fe: FeIq { word: 0, done: false },
             aes: Aes::new(), rsa: Rsa::new(), sha: Sha::new(), wdev: Wdev::new(), i2c_mst: I2cMst::new(), gdma: Gdma::new(), i2s0: I2s::new(CPU_HZ), i2s1: I2s::new(CPU_HZ), rmt: Rmt::new(CPU_HZ),
             io_mux: RegRam::new(), misc: Misc::new(), fake_reads: std::env::var("ESP_EMU_FAKE_READ").ok().map(|v| v.split(',').filter_map(|e| { let mut p = e.split(':'); let a = u32::from_str_radix(p.next()?.trim_start_matches("0x"), 16).ok()?; let o = u32::from_str_radix(p.next().unwrap_or("0").trim_start_matches("0x"), 16).ok()?; let m = u32::from_str_radix(p.next().unwrap_or("ffffffff").trim_start_matches("0x"), 16).ok()?; Some((a, (o, m))) }).collect()).unwrap_or_default(),
             clock: Self::new_clock(),

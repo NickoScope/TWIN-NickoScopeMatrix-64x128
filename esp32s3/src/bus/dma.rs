@@ -531,6 +531,7 @@ impl SocBus {
     /// so a DMA link restart mid-frame (the RGB driver skips LCD_FIFO_PRESERVE_SIZE_PX pixels then)
     /// behaves as on silicon. Frames are published to the board and raise LCD_VSYNC.
     pub(super) fn dma_lcd_step(&mut self, cycles: u64) {
+        if self.periph.lcd_cam.lcd_i8080_running() { self.dma_lcd_i8080_step(cycles); return; }
         if !self.periph.lcd_cam.lcd_running() { return; }
         let (ha, va, bpp, frame_cycles) = self.periph.lcd_cam.lcd_geometry();
         let frame_bytes = (ha * va * bpp) as usize;
@@ -582,6 +583,59 @@ impl SocBus {
             self.periph.lcd_cam.int_raw |= 1 << 0;                                    // LCD_VSYNC_INT
             self.irq_dirty = true;
         }
+    }
+
+    /// LCD i8080 output with LCD_ALWAYS_OUT_EN: the engine clocks one bus word out per PCLK for as
+    /// long as the GDMA out-channel on trigger 5 supplies data. A HUB75 driver hands it a descriptor
+    /// ring that never ends (owner check off, the last `next` back to the first) and double-buffers by
+    /// rewriting that last `next` (ESP32-HUB75-MatrixPanel-DMA 3.0.14, gdma_lcd_parallel16.cpp,
+    /// flip_dma_output_buffer). So every descriptor is read afresh, `next` included, as it is reached.
+    /// The words go to the board in batches, stamped with the pixel clock.
+    fn dma_lcd_i8080_step(&mut self, cycles: u64) {
+        let pclk = self.periph.lcd_cam.lcd_pclk_hz();
+        let hz = crate::periph::CPU_HZ;
+        let lc = &mut self.periph.lcd_cam;
+        lc.i80_frac += cycles * pclk;
+        let words = lc.i80_frac / hz;
+        lc.i80_frac -= words * hz;
+        lc.i80_pending += words;
+        const BATCH_WORDS: u64 = 4096;
+        if lc.i80_pending < BATCH_WORDS { return; }
+        let bus_bytes = lc.lcd_bus_bytes();
+        let mut want = (lc.i80_pending as usize) * bus_bytes;
+        lc.i80_pending = 0;
+        let mut out = std::mem::take(&mut lc.i80_buf);
+        out.clear();
+        let log = lc.lcd_log;
+        if let Some(ch) = self.periph.gdma.out_channel_for(5) {
+            let mut walk = DescriptorWalk::new(GDMA_DESCRIPTOR_STEP_BUDGET);
+            while want > 0 {
+                let c = self.periph.gdma.out[ch];
+                if !c.running || c.desc == 0 { break; }
+                let Ok((_, d)) = walk.read(self, c.desc) else { self.fail_dma_out(ch); break };
+                let (length, eof, buf, next) = (d.length, d.eof, d.buf, d.next);
+                let remaining = length.saturating_sub(c.buf_pos) as usize;
+                if remaining == 0 {
+                    if log { eprintln!("[lcd] i80 desc {:#010x} done (buf {:#010x} len {} eof {}) -> next {:#010x}", c.desc, buf, length, eof, next); }
+                    let ch_ref = &mut self.periph.gdma.out[ch];
+                    ch_ref.int_raw |= 1 << 0;
+                    if eof { ch_ref.int_raw |= 1 << 1; ch_ref.eof_desc = c.desc; }
+                    if ch_ref.int_raw & ch_ref.int_ena != 0 { self.irq_dirty = true; }
+                    if next == 0 { ch_ref.running = false; ch_ref.desc = 0; ch_ref.int_raw |= 1 << 3; self.irq_dirty = true; break; }
+                    ch_ref.desc = next; ch_ref.buf_pos = 0;
+                    continue;
+                }
+                let take = remaining.min(want);
+                if self.append_mapped_bytes(buf.wrapping_add(c.buf_pos), take, &mut out).is_err() { self.fail_dma_out(ch); break; }
+                self.periph.gdma.out[ch].buf_pos += take as u32;
+                want -= take;
+            }
+        }
+        if !out.is_empty() {
+            self.periph.lcd_cam.i80_words += (out.len() / bus_bytes) as u64;
+            self.board.lcd_i8080(pclk, bus_bytes as u8, &out);
+        }
+        self.periph.lcd_cam.i80_buf = out;
     }
 
     /// Gather a finite crypto transaction. Descriptor visits bound both runtime and allocation
