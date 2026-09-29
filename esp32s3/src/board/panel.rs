@@ -7,7 +7,8 @@
 //! marks SUC_EOF closes a refresh. Refreshes are summed into windows of at least 1/60 s, an eye's
 //! worth, and published as light: an LED's share of the most a 1/32-scan LED can emit.
 use std::cell::RefCell;
-use esp_soc::board::BoardModel;
+use esp_soc::board::{BoardEdge, BoardModel, VirtualCycle};
+use super::panel_inputs::PanelInputs;
 use hub75::{Decoder, DecoderConfig, Refresh};
 use hub75::render::{Optics, Renderer};
 
@@ -31,6 +32,8 @@ pub struct Panel {
     pub pclk: u64,
     renderer: RefCell<Renderer>,
     gpio_events: u64,
+    /// The IR receiver on GPIO0, the EC11 knob on IO45/IO46 and BOOT (panel_inputs.rs)
+    pub inputs: PanelInputs,
 }
 
 impl Default for Panel { fn default() -> Self { Self::new() } }
@@ -39,7 +42,7 @@ impl Panel {
     pub fn new() -> Self {
         Panel { dec: Decoder::new(DecoderConfig::default()), words16: Vec::new(), acc: vec![[0; 3]; W * H], acc_clocks: 0, acc_refreshes: 0,
                 window: 10_000_000 / 60, last: Refresh::blank(W, H), light: vec![0; W * H * 3], frames: 0, refreshes: 0, words: 0, pclk: 0,
-                renderer: RefCell::new(Renderer::new(Optics::default(), PANEL_SCALE)), gpio_events: 0 }
+                renderer: RefCell::new(Renderer::new(Optics::default(), PANEL_SCALE)), gpio_events: 0, inputs: PanelInputs::new() }
     }
 
     fn add_refresh(&mut self, r: Refresh) {
@@ -66,7 +69,7 @@ impl Panel {
 }
 
 impl BoardModel for Panel {
-    fn name(&self) -> &'static str { "panel" }
+    fn name(&self) -> &'static str { "hub75-panel" }
     fn gpio_changes(&mut self, changes: &[(u8, bool)]) { self.gpio_events += changes.len() as u64; }
     fn gpio_events(&self) -> u64 { self.gpio_events }
     fn lcd_i8080(&mut self, pclk_hz: u64, bus_bytes: u8, data: &[u8], eof: bool) {
@@ -88,8 +91,14 @@ impl BoardModel for Panel {
     fn display_light(&self) -> Option<(u32, u32, Vec<u16>, u64)> { Some((W as u32, H as u32, self.light.clone(), self.frames)) }
     fn display_version(&self) -> u64 { self.frames }
     fn display_frames(&self) -> u64 { self.frames }
+    fn input_levels(&self) -> Vec<(u8, bool)> { self.inputs.input_levels() }
+    fn next_deadline(&self) -> Option<VirtualCycle> { self.inputs.next_deadline() }
+    fn advance_to(&mut self, cycle: VirtualCycle) { self.inputs.advance_to(cycle) }
+    fn take_edges(&mut self) -> Vec<BoardEdge> { self.inputs.take_edges() }
+    fn check_input(&self, cmd: &str, args: &str) -> Option<Result<(), String>> { self.inputs.check_input(cmd, args) }
+    fn input_at(&mut self, cycle: VirtualCycle, cmd: &str, args: &str) -> Result<(), String> { self.inputs.input_at(cycle, cmd, args) }
     fn report(&self) -> String {
-        format!("[panel] HUB75: {} bus words at {:.2} MHz PCLK, {} refreshes ({:.1} Hz), {} light windows\n",
+        self.inputs.report() + &format!("[panel] HUB75: {} bus words at {:.2} MHz PCLK, {} refreshes ({:.1} Hz), {} light windows\n",
                 self.words, self.pclk as f64 / 1e6, self.refreshes, if self.words > 0 { self.refreshes as f64 * self.pclk as f64 / self.words as f64 } else { 0.0 }, self.frames)
     }
 }

@@ -85,6 +85,13 @@ pub trait BoardModel {
     fn advance_to(&mut self, _cycle: VirtualCycle) {}
     /// Timestamped GPIO input edges emitted by the last advance.
     fn take_edges(&mut self) -> Vec<BoardEdge> { Vec::new() }
+    /// A board's own input verb for scripts and the UI (`ir ok`, `sw 150`, ...), checked before the
+    /// machine's generic verbs so a board can also take over one of those (`knob`, `press sw`).
+    /// None: not this board's verb. Some(Err): its verb, but not these arguments.
+    fn check_input(&self, _cmd: &str, _args: &str) -> Option<Result<(), String>> { None }
+    /// Apply a verb `check_input` accepted, observed at bus cycle `cycle`. Anything it changes on
+    /// the pins comes back through `next_deadline` / `advance_to` / `take_edges`.
+    fn input_at(&mut self, _cycle: VirtualCycle, cmd: &str, _args: &str) -> Result<(), String> { Err(format!("{}: no input `{}`", self.name(), cmd)) }
     /// A pin by the name scripts and the UI use (`btn1`, `sw`, ...).
     fn named_pin(&self, _name: &str) -> Option<u8> { None }
     /// The rotary encoder's (CLK, DT) pins, if there is one.

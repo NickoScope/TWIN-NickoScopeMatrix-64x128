@@ -14,7 +14,7 @@ mod modeled;
 mod web;
 
 #[derive(Clone, Debug)]
-pub enum ScriptAction { Gpio(u8, bool), Serial(String), Uart(usize, String), Stop, Touch(u16, u16, bool), Poke(u32, u32) }
+pub enum ScriptAction { Gpio(u8, bool), Serial(String), Uart(usize, String), Stop, Touch(u16, u16, bool), Poke(u32, u32), Board(String, String) }
 
 /// The stop conditions that are not observers.
 pub struct Debug { pub stop_on_unimplemented: bool, pub stop_after_exceptions: u64 }
@@ -986,6 +986,7 @@ impl<S: Soc> Machine<S> {
                 ScriptAction::Stop => { self.max_cycles = 0; stopped = true; }
                 ScriptAction::Touch(x, y, d) => { self.bus.touch_input(x, y, d); }
                 ScriptAction::Poke(a, v) => { let _ = self.bus.write32_unpriced(a, v); }
+                ScriptAction::Board(cmd, args) => { if let Err(e) = self.bus.board_input(&cmd, &args) { eprintln!("[script] {}", e); } }
             }
         }
         stopped
@@ -1050,6 +1051,7 @@ impl<S: Soc> Machine<S> {
     /// Parse a script: one action per line, `<seconds> <cmd> [args]`.
     ///   press <pin> [ms]   release <pin>   gpio <pin> <0|1>   serial <text...>   knob <cw|ccw> [detents]   touch <x> <y> <0|1>   poke <addr> <value>   stop
     /// Pins are numbers or the board's names (`btn1`, `sw`, ...); buttons/encoder are active-low with pull-ups (release = 1).
+    /// A board's own verbs (`BoardModel::check_input`) come first and may take over `press`/`knob`.
     pub fn load_script(&mut self, text: &str) -> Result<(), String> {
         let hz = S::CPU_HZ as f64;
         let mut ev: Vec<(u64, ScriptAction)> = Vec::new();
@@ -1063,6 +1065,11 @@ impl<S: Soc> Machine<S> {
             let board = self.bus.board_ref();
             let pin = |s: &str| -> Result<u8, String> { board.named_pin(s).map(Ok).unwrap_or_else(|| s.parse().map_err(|_| format!("line {}: bad pin {}", ln + 1, s))) };
             let c = (t * hz) as u64;
+            if let Some(r) = board.check_input(cmd, rest) {
+                r.map_err(|e| format!("line {}: {}", ln + 1, e))?;
+                ev.push((c, ScriptAction::Board(cmd.to_string(), rest.to_string())));
+                continue;
+            }
             match cmd {
                 "press" => { let mut p = rest.split_whitespace(); let pn = pin(p.next().unwrap_or(""))?; let ms: f64 = p.next().map(|x| x.parse().unwrap_or(100.0)).unwrap_or(100.0);
                              ev.push((c, ScriptAction::Gpio(pn, false))); ev.push((c + (ms / 1000.0 * hz) as u64, ScriptAction::Gpio(pn, true))); }
