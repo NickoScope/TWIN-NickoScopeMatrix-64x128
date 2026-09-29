@@ -283,7 +283,17 @@ void main() {
     conBuf += s; if (conBuf.length > 60000) conBuf = conBuf.slice(-40000);
     const atEnd = con.scrollTop + con.clientHeight >= con.scrollHeight - 4;
     con.textContent = conBuf; if (atEnd) con.scrollTop = con.scrollHeight;
-    const m = /IP Address: ([0-9.]+)/.exec(s); if (m) $('portal').innerHTML = `Прошивка получила адрес ${m[1]} в виртуальной Wi-Fi; её портал проброшен на <a href="http://127.0.0.1:8080/" target="_blank" rel="noopener">127.0.0.1:8080</a>.`;
+    const m = /IP Address: ([0-9.]+)/.exec(s);
+    if (m) {
+      // 10.0.2.x: the engine's own NAT, the portal is forwarded to 127.0.0.1:8080 (twin.py run).
+      // Any other address came from the home router through the bridge (twin.py run --lan).
+      const nat = m[1].startsWith('10.0.2.');
+      const url = nat ? 'http://127.0.0.1:8080/' : `http://${m[1]}/`;
+      $('portalLink').href = url;
+      $('portal').innerHTML = nat
+        ? `Прошивка получила адрес ${m[1]} в виртуальной Wi-Fi; её портал проброшен на <a href="${url}" target="_blank" rel="noopener">127.0.0.1:8080</a>.`
+        : `Двойник в домашней сети: адрес ${m[1]} от роутера. Портал: <a href="${url}" target="_blank" rel="noopener">${m[1]}</a>.`;
+    }
   }
   function connect() {
     ws = new WebSocket(`ws://${location.host}/ws`); ws.binaryType = 'arraybuffer';
