@@ -113,8 +113,12 @@ GPIO0 is the wired-AND of the receiver, the switch and BOOT. Script verbs (also 
 `knob timing <state_ms> <gap_ms>`, `sw [ms]|down|up`, `boot [ms]|down|up`, and `press`/`release`
 of `sw`, `knob`, `boot`; `climate <°C> <%RH>` sets the air at the SHTC3 from its next measurement
 (-40..125 °C, 0..100 %RH, datasheet Tables 1-2). `press 0` is refused; `gpio 0 <level>` still writes the pin raw until the
-next device edge. BOOT held through a reset does not select download mode here: the strap
-register is `--strap`. `tools/panel-inputs-oracle/` replays a run's `--vcd` edges through the
+next device edge. BOOT or the knob's switch held through the page's RESET (a power-on Chip
+Reset) latches GPIO0 = 0 with IO46 = 0 into `GPIO_STRAPPING[3:2]`, so the ROM stops in joint
+download mode as the board does; released, the next RESET boots from flash. Software and
+watchdog resets keep the latch (only a Chip Reset samples the pins, ESP32-S3 TRM §8.1 and Table
+7.1-1), the other strap bits stay `--strap`, and the run's first boot takes the whole strap from
+`--strap`. `tools/panel-inputs-oracle/` replays a run's `--vcd` edges through the
 firmware's own decoder sources built on the host (IRremoteESP8266 `decode()`, `ir_map.h`,
 `control.cpp`).
 

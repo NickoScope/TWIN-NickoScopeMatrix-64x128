@@ -135,9 +135,27 @@ impl esp_soc::SocBus for SocBus {
         p.i2s0.pcm = old.i2s0.pcm; p.i2s0.frames_out = old.i2s0.frames_out; p.i2s1.pcm = old.i2s1.pcm; p.i2s1.frames_out = old.i2s1.frames_out;   // keep the captured audio continuous
         // The virtual AP and the network behind it are the world outside the chip: a reset leaves
         // them there. The AP forgets the station (it must associate again), the network keeps its
-        // NAT flows, forwarded host ports and lease, as a router would for a rebooting client.
+        // forwarded host ports, lease and UDP flows, as a router would for a rebooting client. The
+        // station's TCP connections died with its stack: the NAT forgets them, or the rebooted
+        // guest, whose fixed-seed RNG draws the same local ports, meets its old flows (review 6).
         p.wifi.ap = old.wifi.ap.map(|a| { let stats = a.stats; let mut n = crate::wifi::VirtualAp::new(a.cfg, a.log); n.stats = stats; n });
         p.wifi.net = old.wifi.net;
+        if let Some(nat) = p.wifi.net.as_mut().and_then(|n| n.nat.as_mut()) { nat.station_reset(); }
+        // A Chip Reset re-latches the strapping pins from the levels on them (ESP32-S3 TRM §8.1
+        // "During Chip Reset ... hardware captures samples"; datasheet §3 "At Chip Reset, the
+        // latches sample"). Its code is 0x01 (TRM Table 7.1-1; IDF soc/esp32s3/reset_reasons.h
+        // RESET_REASON_CHIP_POWER_ON, _CHIP_BROWN_OUT and _CHIP_SUPER_WDT are all 0x01). 0x0F is
+        // the System Reset form of brown-out (RESET_REASON_SYS_BROWN_OUT), 0x10/0x12/0x13 are
+        // System Resets in that table, the rest core and CPU resets: none of them re-latch. Only
+        // the boot-mode bits the board drives change: GPIO_STRAPPING[3] = GPIO0, [2] = GPIO46 (IDF
+        // 5.5.4 soc/esp32s3/include/soc/boot_mode.h: IS_1XXX SPI boot, IS_00XX joint download).
+        // The other bits stay `--strap`, and a board without input levels keeps them all.
+        if cause == esp_periph::RST_POWERON {
+            for (pin, level) in self.board.input_levels() {
+                let bit = match pin { 0 => 3, 46 => 2, _ => continue };
+                if level { self.periph.gpio.strap |= 1 << bit } else { self.periph.gpio.strap &= !(1 << bit) }
+            }
+        }
         self.mmu = [MMU_INVALID; MMU_ENTRIES];
         self.invalidate_tlb();
         self.reset_approximate_cache();

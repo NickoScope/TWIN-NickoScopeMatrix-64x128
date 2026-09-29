@@ -1337,3 +1337,28 @@ fn sdmmc_card_detect_follows_the_gpio_matrix_and_commands_time_out() {
     assert_eq!(bus.read32(SDMMC + 0x44).unwrap(), CMD_DONE);
     assert_eq!(bus.periph.sdmmc.cmds, 2);
 }
+
+/// Review 7: the `--flash-persist` write-through is portable (seek + write through `&File`, no
+/// Unix `write_at`), lands each changed range at its own offset, clamps at the end of the flash
+/// and leaves the rest of the file alone.
+#[test]
+fn persist_flash_writes_each_changed_range_at_its_offset() {
+    let path = std::env::temp_dir().join(format!("esp32s3-persist-{}.bin", std::process::id()));
+    let mut bus = SocBus::new(4 << 16, 2 << 16, [0; 6]);
+    std::fs::write(&path, &bus.flash).unwrap();
+    bus.flash_file = Some(std::fs::OpenOptions::new().write(true).open(&path).unwrap());
+    let n = bus.flash.len();
+    bus.flash[0x1_0010..0x1_0013].copy_from_slice(&[1, 2, 3]);
+    bus.flash[n - 2..].copy_from_slice(&[4, 5]);
+    bus.flash[0x100] = 9;                           // changed, but never reported: stays 0xff on disk
+    bus.persist_flash(0x1_0010, 3);
+    bus.persist_flash(n - 2, 16);                   // clamped at the end of the flash
+    bus.persist_flash(n, 4);                        // wholly past the end: nothing
+    let disk = std::fs::read(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(disk.len(), n, "the file never grows past the flash");
+    assert_eq!(&disk[0x1_0010..0x1_0013], &[1, 2, 3]);
+    assert_eq!(&disk[n - 2..], &[4, 5]);
+    assert_eq!(disk[0x100], 0xff);
+    assert_eq!(disk.iter().filter(|&&b| b != 0xff).count(), 5);
+}

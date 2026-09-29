@@ -407,7 +407,13 @@ impl Nat {
         let flags = seg[13];
         let data = &seg[off..];
         let window = u16::from_be_bytes([seg[14], seg[15]]);
-        let idx = self.tcp.iter().position(|c| c.guest_ip == *gip && c.guest_port == sport && c.dst_port == dport && c.dst_ip == *dip);
+        let mut idx = self.tcp.iter().position(|c| c.guest_ip == *gip && c.guest_port == sport && c.dst_port == dport && c.dst_ip == *dip);
+        // A pure SYN on the 4-tuple of a finished flow is a new connection: the guest's stack let
+        // the old one go (RFC 9293 section 3.6.1 MAY-2, a new SYN may reopen from TIME-WAIT). The
+        // old flow holds no host socket any more, so it simply makes room.
+        if flags & (SYN | ACK | RST) == SYN && idx.is_some_and(|i| matches!(self.tcp[i].transport, Transport::TimeWait | Transport::Closed)) {
+            self.tcp.remove(idx.take().unwrap());
+        }
         if flags & (SYN | ACK | RST) == SYN && idx.is_none() {
             let evict = if self.tcp.len() >= MAX_FLOWS {
                 // Finished flows remember final ACKs only while their bounded slots are spare.
@@ -426,7 +432,8 @@ impl Nat {
         }
         let Some(i) = idx else { return Vec::new() };
         let c = &mut self.tcp[i];
-        c.last_activity_us = now_us;
+        // Only a segment the flow takes keeps it alive: a dropped one refreshing the idle timer
+        // would let a guest's retries hold a stale flow open forever (review 6).
         if flags & RST != 0 {
             let refused = c.inbound && c.handshake_pending();
             c.transport = Transport::Closed;
@@ -437,15 +444,27 @@ impl Nat {
             return Vec::new();
         }
         if matches!(c.transport, Transport::TimeWait) {
-            return if flags & FIN != 0 { vec![c.segment(ACK, &[], c.our_seq)] } else { Vec::new() };
+            // A retransmitted FIN: ACK it and restart the 2 MSL timeout (RFC 9293 section
+            // 3.10.7.4, eighth step, TIME-WAIT STATE); anything else is dropped.
+            if flags & FIN == 0 { return Vec::new(); }
+            c.last_activity_us = now_us;
+            return vec![c.segment(ACK, &[], c.our_seq)];
         }
         if flags & SYN != 0 {
-            if c.inbound { return c.syn_ack(seq, ack, flags, window); }
-            return if c.handshake_pending() { vec![c.segment(SYN | ACK, &[], c.unacked[0].seq)] } else { Vec::new() };
+            if c.inbound { c.last_activity_us = now_us; return c.syn_ack(seq, ack, flags, window); }
+            if c.handshake_pending() { c.last_activity_us = now_us; return vec![c.segment(SYN | ACK, &[], c.unacked[0].seq)]; }
+            // A SYN on a synchronized connection gets a challenge ACK <SEQ=SND.NXT><ACK=RCV.NXT>
+            // (RFC 9293 section 3.10.7.4, fourth step, after RFC 5961). A guest that no longer has
+            // this connection sits in SYN-SENT and answers the bare ACK with a reset, then sends
+            // its SYN again at once (lwIP tcp_in.c SYN_SENT, "possibly a half-open connection", as
+            // read in IDF 5.5.4's copy; the firmware's IDF 4.4 esp-lwip not re-read): the reset
+            // closes this flow and the SYN opens a new one.
+            return if matches!(c.transport, Transport::Connected(_)) { vec![c.segment(ACK, &[], c.our_seq)] } else { Vec::new() };
         }
         // SYN-SENT accepts only a SYN-ACK or a reset (RFC 9293 section 3.10.7.3).
         if c.inbound && c.handshake_pending() { return Vec::new(); }
         if !matches!(c.transport, Transport::Connected(_)) { return Vec::new(); }
+        c.last_activity_us = now_us;
         if flags & ACK != 0 { c.acknowledge(ack); c.guest_window = window; }
         if c.handshake_pending() { return Vec::new(); }
         if !data.is_empty() || flags & FIN != 0 {
@@ -453,6 +472,17 @@ impl Nat {
             return vec![c.segment(ACK, &[], c.our_seq)];
         }
         Vec::new()
+    }
+
+    /// TCP flows held now, live or finishing (TIME-WAIT, closed until the next poll).
+    pub fn tcp_flows(&self) -> usize { self.tcp.len() }
+
+    /// The station rebooted and its TCP state is gone: forget every TCP flow, closing its host
+    /// socket (inbound forwarded connections too). Forwards, the lease, `next_port` and the UDP
+    /// flows stay. Without this the rebooted guest, whose ports repeat, meets its old flows.
+    pub fn station_reset(&mut self) {
+        if self.log && !self.tcp.is_empty() { eprintln!("[nat] station reset: {} TCP flows forgotten", self.tcp.len()); }
+        self.tcp.clear();
     }
 
     /// Pump a bounded amount of host traffic, then retransmit and expire flows.

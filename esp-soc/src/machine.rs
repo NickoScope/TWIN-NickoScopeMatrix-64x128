@@ -529,6 +529,12 @@ impl<S: Soc> Machine<S> {
         assert!(self.quantum != 0, "scheduling quantum must be nonzero");
         let (cpi_base, max_quantum) = if APPROXIMATE { self.approximate_jit_timing.unwrap() } else { (1, self.quantum as u32) };
         let mut cpi = cpi_base;
+        // The cores keep the CPI of the last round of the previous call (base + 1 in frac/256 of
+        // rounds); a call that starts from `cpi_base` must start them there too, or each busy core
+        // charges base + 1 per instruction against a round of `quantum * base` until the next
+        // switch, and its CCOUNT runs ahead of bus time for good (review 9). The diffusion itself
+        // lives in `approximate_cpi_acc`, which carries across calls, so the average stays exact.
+        if APPROXIMATE { for core in &mut self.cores { core.set_approximate_cpi(cpi_base); } }
         self.stub_bloom = self.stubs.keys().fold(0, |m, &pc| m | pc_bit(pc));
         self.probe_bloom = self.fn_probes.keys().fold(0, |m, &pc| m | pc_bit(pc));
         for c in &mut self.cores {

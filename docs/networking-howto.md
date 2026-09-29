@@ -68,6 +68,11 @@ and the NAT (`--net nat`, the default).
 - **Several connections** are fine, up to the NAT's 64 flows shared with outbound traffic; beyond
   that, new ones wait in the backlog until a flow ends. A server that handles one client at a time
   (Arduino `WebServer`) serves parallel requests one after another.
+- **A chip reset** (the page's Restart, `esp_restart()`, the reboot after an OTA) leaves the AP,
+  the lease, the forwarded ports and the UDP flows in place. The NAT forgets the station's TCP
+  connections and closes their host sockets: the rebooted firmware's stack starts from nothing and
+  draws the same local ports as before (the emulated RNG repeats), so a flow left over would take
+  its first connections for old ones and drop them.
 - **UDP.** A datagram to `HOSTPORT` reaches the guest's `GUESTPORT` from `10.0.2.2:HOSTPORT`; what
   the guest sends back to that address goes to the host peer that sent the last datagram. Payloads
   over 1472 bytes (one unfragmented packet) are dropped.
