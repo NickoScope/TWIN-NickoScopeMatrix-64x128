@@ -48,6 +48,8 @@ pub struct SocBus {
     pub rtc_fast: Vec<u8>,
     pub rtc_slow: Vec<u8>,
     pub flash: Vec<u8>,
+    /// The flash chip's backing file (`--flash-persist`): every program and erase is written through.
+    pub flash_file: Option<std::fs::File>,
     pub psram: Vec<u8>,
     pub mmu: [u32; MMU_ENTRIES],
     pub periph: Peripherals,
@@ -136,6 +138,15 @@ fn tlb_idx(addr: u32) -> usize { xtensa_lx7::bus::tlb_index(addr) }
 static BUS_EPOCHS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl SocBus {
+    /// Write a changed flash range through to the backing file, so NVS, LittleFS and OTA slots
+    /// survive the run as they survive a power cycle.
+    fn persist_flash(&mut self, off: usize, len: usize) {
+        use std::os::unix::fs::FileExt;
+        let Some(f) = &self.flash_file else { return };
+        let end = (off + len).min(self.flash.len());
+        if off >= end { return; }
+        if let Err(e) = f.write_at(&self.flash[off..end], off as u64) { eprintln!("[emu] flash file: write at {:#x}: {}", off, e); }
+    }
     pub(crate) fn cancel_spi2_timing(&mut self) { self.spi2_scheduled = None; }
 
     pub fn new(flash_size: usize, psram_size: usize, mac: [u8; 6]) -> Self { Self::with_sizes(flash_size, psram_size, mac) }
@@ -143,7 +154,7 @@ impl SocBus {
         let bus_uninit = SocBus {
             sram: vec![0; SRAM_SIZE], irom: vec![0; (IROM_MASK_HIGH - IROM_MASK_LOW) as usize], drom: vec![0; (DROM_MASK_HIGH - DROM_MASK_LOW) as usize],
             rtc_fast: vec![0; 8192], rtc_slow: vec![0; 8192], flash: vec![0xff; flash_size], psram: vec![0; psram_size],
-            mmu: [MMU_INVALID; MMU_ENTRIES], periph: Peripherals::new(mac), board: Box::new(crate::board::Atech14::new()), cycles: 0, last_fault: None, spi2_dma_fault: None, irq_dirty: false, gpio_events: None, debug: Default::default(),
+            mmu: [MMU_INVALID; MMU_ENTRIES], flash_file: None, periph: Peripherals::new(mac), board: Box::new(crate::board::Atech14::new()), cycles: 0, last_fault: None, spi2_dma_fault: None, irq_dirty: false, gpio_events: None, debug: Default::default(),
             spi2_timing: false, spi2_scheduled: None,
             tlb: vec![TlbEntry::EMPTY; TLB_SIZE], page_ver: Vec::new(), ver_base: [0; 7], flash_epoch: BUS_EPOCHS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) << 32, code_blk: Vec::new(), tick_pending: 0, tick_budget: 0, defer_mmio: false, mmio_deferred: false, vq_violations: 0,
             approximate_cache: None, approximate_cache_pending: 0, approximate_cache_fast_internal: false, approximate_cache_inline: false,
@@ -499,7 +510,10 @@ impl SocBus {
         if self.periph.spi_exec {
             self.periph.spi_exec = false;
             self.periph.spi1.execute(&mut self.flash, &mut self.psram);
-            for (m, off, len) in std::mem::take(&mut self.periph.spi1.dirty) { self.note_written(match m { crate::periph::DirtyMem::Flash => SRC_FLASH, crate::periph::DirtyMem::Psram => SRC_PSRAM }, off, len); }
+            for (m, off, len) in std::mem::take(&mut self.periph.spi1.dirty) {
+                if m == crate::periph::DirtyMem::Flash { self.persist_flash(off, len); }
+                self.note_written(match m { crate::periph::DirtyMem::Flash => SRC_FLASH, crate::periph::DirtyMem::Psram => SRC_PSRAM }, off, len);
+            }
         }
     }
 

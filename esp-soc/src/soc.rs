@@ -90,6 +90,10 @@ pub trait SocBus: Bus {
     fn misc(&mut self) -> &mut Misc;
     fn load_bytes(&mut self, addr: u32, data: &[u8]) -> Result<(), String>;
     fn write_flash(&mut self, offset: usize, data: &[u8]) -> Result<(), String>;
+    /// The flash array's size and contents (for a backing file), where the chip keeps one here.
+    fn flash_contents(&self) -> Option<&[u8]> { None }
+    /// Back the flash with a file every program and erase is written through to.
+    fn set_flash_file(&mut self, _f: std::fs::File) -> Result<(), String> { Err("this chip keeps no flash file".into()) }
     /// Map and copy the app image at flash `app_off` as the bootloader would; returns the entry point.
     fn boot_app(&mut self, app_off: usize) -> Result<u32, String>;
     /// Chip reset: re-create the digital peripherals, keep what survives on silicon. Returns the cause.

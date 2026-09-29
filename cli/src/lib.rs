@@ -67,7 +67,7 @@ pub struct Opts {
     pub approximate_cache: bool,
     pub chip: String,
     pub rom: Option<PathBuf>, pub bootloader: Option<String>, pub ptable: Option<String>, pub app: Option<String>, pub elfs: Vec<String>,
-    pub flash_image: Option<String>, pub flash_at: Vec<String>, pub boot: Option<String>, pub flash_mb: Option<usize>, pub psram_mb: Option<usize>, pub flash_id: Option<[u8; 3]>,
+    pub flash_image: Option<String>, pub flash_at: Vec<String>, pub boot: Option<String>, pub flash_mb: Option<usize>, pub psram_mb: Option<usize>, pub flash_id: Option<[u8; 3]>, pub flash_persist: Option<String>, pub serial_hex: Vec<u8>,
     pub mac: Option<[u8; 6]>, pub strap: Option<u32>, pub reset_cause: Option<u32>, pub efuse_regs: Option<String>, pub regs_init: Option<String>,
     pub board: String, pub wifi: Option<String>, pub net: String, pub cam_image: Option<String>, pub cam_fps: f64,
     pub spi2_timing: bool, pub measured_te: bool,
@@ -123,6 +123,12 @@ pub fn parse(args: &[String], default_chip: &str) -> Opts {
             "--max-seconds" => o.max_seconds = Some(next().parse().expect("seconds")),
             "--script" => o.script = Some(next()),
             "--serial" => o.serial = Some(next()),
+            // Raw bytes into the USB-Serial/JTAG console before the run, as hex (an Improv-Serial packet)
+            "--serial-hex" => { let h = next(); let h = h.trim(); if h.len() % 2 != 0 { usage_error("--serial-hex: an even number of hex digits"); }
+                                o.serial_hex.extend((0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap_or_else(|_| usage_error("--serial-hex: hex digits only")))); }
+            // The flash chip as a file: loaded if it exists (the images are then only its first
+            // contents), created from the images if not, and every program and erase written through.
+            "--flash-persist" => o.flash_persist = Some(next()),
             "--console" => o.console = Some(next()),
             "--console-prefix" => o.console_prefix = true,
             "--realtime" => o.realtime = true,
@@ -393,8 +399,19 @@ fn prepare<S: Soc>(m: &mut Machine<S>, o: &Opts) -> String {
         m.write_flash(off, &data).unwrap_or_else(|e| { eprintln!("--flash-at: {}", e); std::process::exit(2) });
         eprintln!("[emu] flash {:#x}: {} ({} bytes)", off, path, data.len());
     }
+    if let Some(p) = &o.flash_persist {
+        let size = m.bus.flash_contents().map(|f| f.len()).unwrap_or_else(|| usage_error("--flash-persist: this chip keeps no flash here"));
+        match std::fs::read(p) {
+            Ok(data) if data.len() == size => { m.write_flash(0, &data).unwrap(); eprintln!("[emu] flash chip {} ({} MB): its own contents, the images are ignored", p, size >> 20); }
+            Ok(data) => usage_error(&format!("--flash-persist {}: {} bytes, but the flash is {}", p, data.len(), size)),
+            Err(_) => { std::fs::write(p, m.bus.flash_contents().unwrap()).unwrap_or_else(|e| usage_error(&format!("--flash-persist {}: {}", p, e))); eprintln!("[emu] flash chip {} created from the images", p); }
+        }
+        let f = std::fs::OpenOptions::new().write(true).open(p).unwrap_or_else(|e| usage_error(&format!("--flash-persist {}: {}", p, e)));
+        m.bus.set_flash_file(f).unwrap_or_else(|e| usage_error(&e));
+    }
     for p in &o.elfs { m.add_symbols(&std::fs::read(p).expect("elf")).expect("elf symbols"); }
     if let Some(s) = &o.serial { m.bus.serial_input(s.as_bytes()); }
+    if !o.serial_hex.is_empty() { m.bus.serial_input(&o.serial_hex); }
     for pre in &o.trace_fns {
         let n = m.trace_fns(pre);
         eprintln!("[emu] --trace-fn {}: {} functions", pre, n);
