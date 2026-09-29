@@ -17,6 +17,11 @@ MAC is handled by two layers in front of the host network:
   and retransmits; UDP flows are a bound `UdpSocket` per (port, destination) with a reply path
   and an idle reaper. Name lookups are forwarded to the host's own first resolver from
   `/etc/resolv.conf`. `--net none` refuses outbound traffic instead (immediate RST).
+- **Inbound**, `--hostfwd tcp:8080-80` / `udp:4210-4210`: a listener on 127.0.0.1 whose accepted
+  connections the NAT opens toward the leased station from the gateway address — a SYN on the same
+  retransmission queue, the guest's SYN-ACK checked as in SYN-SENT, then the ordinary flow. UDP
+  datagrams arrive from the gateway and the guest's answers go back to the last host peer
+  (docs/networking-howto.md, "Reaching the firmware from the Mac").
 
 No libslirp, no tun device, no entitlement, no root. TLS works: the panel fetches
 `https://www.elprisetjustnu.se` and polls Home Assistant on the LAN. That needed the RSA/MPI
@@ -24,8 +29,6 @@ accelerator, SHA over GDMA (including SHA-384) and AES-CTR — see docs/peripher
 
 ## Not there yet
 
-- **Inbound**: no port forwarding, so a server in the guest (autopling's web UI) is not reachable
-  from the Mac. A `hostfwd=tcp:127.0.0.1:8080-:80` option over the same NAT is the natural next step.
 - **Multicast/mDNS**: not carried, so `esp-web.local` and Home Assistant discovery do not resolve;
   use IP addresses.
 - **Real LAN presence**: a `--net tap`/vmnet backend would give the guest an address on the real

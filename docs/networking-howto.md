@@ -37,6 +37,43 @@ network are the same code, the MAC model is the C6's own ([wifi-c6-plan.md](wifi
 radio run also needs `--stub bb_init=0`, and what has been tried is one station on one open or
 WPA2 network; `examples/c6-wifi-station` has the full command. The C3 has no WiFi model.
 
+## Reaching the firmware from the Mac
+
+A web UI, an API or a UDP listener inside the guest is reached through host ports forwarded into
+it, as QEMU's `hostfwd` does:
+
+```sh
+esp32sim ... --wifi "ssid=esp32sim,psk=esp32sim-pass" --realtime \
+    --hostfwd tcp:8080-80 --hostfwd tcp:8081-81 --hostfwd udp:4210-4210
+curl http://127.0.0.1:8080/
+```
+
+`--hostfwd PROTO:HOSTPORT-GUESTPORT` is repeatable; `PROTO` is `tcp` or `udp`. It needs `--wifi`
+and the NAT (`--net nat`, the default).
+
+- **Only 127.0.0.1.** The host port is bound on the loopback address, never on `0.0.0.0`, so the
+  guest is reachable from this Mac and not from the LAN. There is no switch to widen it.
+- **The station is whatever DHCP leased** (10.0.2.15 by default). Until the firmware has taken its
+  lease, connections and datagrams wait on the host side (the listen backlog, the socket buffer);
+  they go in once it has. Firmware with a static IP and no DHCP is not reached.
+- **TCP.** Each accepted connection is opened toward the guest from the gateway, 10.0.2.2, with a
+  port from 49152 up, so the firmware sees every client as 10.0.2.2. From the handshake on it is the
+  same relay as an outbound connection. A guest port nobody listens on answers with a reset, and the
+  host client sees the connection closed without data (`curl: (52) Empty reply from server`) — which
+  is also what happens in the seconds between the lease and the firmware starting its server. A SYN
+  the guest does not answer for 30 s of emulated time gives up the same way.
+- **Several connections** are fine, up to the NAT's 64 flows shared with outbound traffic; beyond
+  that, new ones wait in the backlog until a flow ends. A server that handles one client at a time
+  (Arduino `WebServer`) serves parallel requests one after another.
+- **UDP.** A datagram to `HOSTPORT` reaches the guest's `GUESTPORT` from `10.0.2.2:HOSTPORT`; what
+  the guest sends back to that address goes to the host peer that sent the last datagram. Payloads
+  over 1472 bytes (one unfragmented packet) are dropped.
+- **Pace it.** Add `--realtime` (or `--web`) when anything on the host talks to the guest: without
+  pacing, emulated time runs faster than wall time, and a browser's seconds become the firmware's
+  minutes (timeouts, keep-alives).
+- The end-of-run report counts it: `[emu] hostfwd: N TCP connections into the guest (M refused or
+  unanswered), N UDP datagrams in, N answers out`; `ESP_EMU_DEBUG_NET=1` logs each one.
+
 ## What the network gives the firmware
 
 - **DHCP** — address, mask, gateway, DNS, so `esp_netif` reaches `IP_EVENT_STA_GOT_IP`.
@@ -55,7 +92,7 @@ WPA2 network; `examples/c6-wifi-station` has the full command. The C3 has no WiF
 
 | Switch | Shows |
 | --- | --- |
-| `ESP_EMU_DEBUG_NET=1` | DHCP/ARP/ICMP/DNS exchanges and every NAT flow |
+| `ESP_EMU_DEBUG_NET=1` | DHCP/ARP/ICMP/DNS exchanges, every NAT flow and every forwarded connection |
 | `ESP_EMU_DEBUG_WIFI=1` | MAC-level events: descriptors, interrupts, TX queues |
 | `ESP_EMU_DEBUG_WIFI_FRAMES=1` | every 802.11 frame on the air, decoded |
 | `ESP_EMU_DEBUG_AES/SHA/RSA=1` | each accelerator operation as firmware requests it |
@@ -75,8 +112,8 @@ WPA2 network; `examples/c6-wifi-station` has the full command. The C3 has no WiF
 
 ## Known limits
 
-- **Inbound connections** are not forwarded yet, so a server inside the guest (a firmware web UI)
-  cannot be opened from the host.
+- **Inbound** is by forwarded port only (`--hostfwd`, above), from 127.0.0.1; the guest sees
+  every forwarded client as the gateway.
 - **Multicast and mDNS** do not cross the NAT: `something.local` will not resolve, and Home
   Assistant / ESP-IDF discovery protocols will not see anything. Use IP addresses.
 - **UDP reply peers** must match the destination IP and port of the outgoing datagram. The
