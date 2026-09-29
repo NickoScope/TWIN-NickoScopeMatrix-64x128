@@ -1,4 +1,4 @@
-# NickoScope's fork: a virtual twin of an LED panel
+# TWIN-NickoScopeMatrix-64x128: a virtual twin of an LED panel
 
 This fork of [esp32sim](https://github.com/joakimeriksson/esp32sim) by Joakim Eriksson runs the
 unmodified firmware of [AnimatedPixelClock](https://github.com/NickoScope/AnimatedPixelClock) for a
