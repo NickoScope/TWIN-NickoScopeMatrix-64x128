@@ -3,10 +3,10 @@
 
 The oracle is the research re-implementation of ESP32-HUB75-MatrixPanel-DMA 3.0.14's
 buffer build and a reference stream decoder:
-    /Users/apple/AnimatedPixelClock-twin/tools/twin/research/model.py
-It reads lumConvTab_8bit from the library header that the firmware compiles:
-    /Users/apple/AnimatedPixelClock-netbroker/.pio/libdeps/matrix-waveshare-rgb/
-        ESP32 HUB75 LED MATRIX PANEL DMA Display/src/cie_luts.h
+    tools/twin/research/model.py in NickoScope/AnimatedPixelClock (HUB75_ORACLE_DIR)
+It reads lumConvTab_8bit from the library header that the firmware compiles
+(HUB75_CIE_LUTS), in the firmware checkout after a PlatformIO build:
+    .pio/libdeps/matrix-waveshare-rgb/ESP32 HUB75 LED MATRIX PANEL DMA Display/src/cie_luts.h
 
 Run (takes about two minutes, the oracle decoder is plain Python):
     python3 hub75/fixtures/gen_oracle.py hub75/tests/oracle/mod.rs
@@ -21,9 +21,11 @@ import os
 import re
 import sys
 
-ORACLE_DIR = "/Users/apple/AnimatedPixelClock-twin/tools/twin/research"
-LUT_PATH = ("/Users/apple/AnimatedPixelClock-netbroker/.pio/libdeps/matrix-waveshare-rgb/"
-            "ESP32 HUB75 LED MATRIX PANEL DMA Display/src/cie_luts.h")
+import os
+
+# Where the oracle and the library header are on this machine (both from the firmware repository).
+ORACLE_DIR = os.environ.get("HUB75_ORACLE_DIR") or sys.exit("set HUB75_ORACLE_DIR to the firmware repo's tools/twin/research")
+LUT_PATH = os.environ.get("HUB75_CIE_LUTS") or sys.exit("set HUB75_CIE_LUTS to the HUB75 library's src/cie_luts.h (firmware .pio/libdeps)")
 
 sys.path.insert(0, ORACLE_DIR)
 _stdout = sys.stdout
