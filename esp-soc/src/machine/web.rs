@@ -14,6 +14,14 @@ fn display_message(width: u32, height: u32, pixels: &[u16]) -> Vec<u8> {
     message
 }
 
+/// Type 5: linear light, 3 x u16 little-endian per pixel (an LED panel the page renders itself).
+fn light_message(width: u32, height: u32, light: &[u16]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(5 + light.len() * 2);
+    message.extend_from_slice(&[5, width as u8, (width >> 8) as u8, height as u8, (height >> 8) as u8]);
+    message.extend(light.iter().flat_map(|v| v.to_le_bytes()));
+    message
+}
+
 fn camera_message(rgb: &[u8]) -> Vec<u8> {
     let mut message = Vec::with_capacity(5 + rgb.len());
     message.extend_from_slice(&[4, 64, 1, 240, 0]); // 320 by 240 preview, little-endian u16
@@ -49,7 +57,10 @@ impl<S: Soc> Machine<S> {
         self.ws.px_pending = ver;
         self.ws.px_deferred = changed && !due;
         if due {
-            if let Some((w_, h_, px, _)) = board.display() {
+            if let Some((w_, h_, light, _)) = board.display_light() {
+                self.ws.px_sent = ver;
+                w.send_binary(&light_message(w_, h_, &light));
+            } else if let Some((w_, h_, px, _)) = board.display() {
                 self.ws.px_sent = ver;
                 w.send_binary(&display_message(w_, h_, &px));
             }
@@ -90,7 +101,8 @@ impl<S: Soc> Machine<S> {
             hello.push(frame(1, format!("{{\"t\":\"serial\",\"src\":\"uart0\",\"data\":\"{}\"}}", json_escape(&String::from_utf8_lossy(&self.console.uart0))).as_bytes()));
             hello.push(frame(1, format!("{{\"t\":\"serial\",\"src\":\"usb\",\"data\":\"{}\"}}", json_escape(&String::from_utf8_lossy(&self.console.usb))).as_bytes()));
             hello.push(frame(1, format!("{{\"t\":\"board\",\"name\":\"{}\"}}", board.name()).as_bytes()));
-            if let Some((w_, h_, px, _)) = board.display() { hello.push(frame(2, &display_message(w_, h_, &px))); }
+            if let Some((w_, h_, light, _)) = board.display_light() { hello.push(frame(2, &light_message(w_, h_, &light))); }
+            else if let Some((w_, h_, px, _)) = board.display() { hello.push(frame(2, &display_message(w_, h_, &px))); }
             if let Some(rgb) = board.camera_preview(320, 240) { hello.push(frame(2, &camera_message(&rgb))); }
             if let Some((leds, _)) = board.leds() { hello.push(frame(1, format!("{{\"t\":\"ring\",\"leds\":[{}]}}", leds_json(leds)).as_bytes())); }
             for (id, leds, _) in board.led_grids() { hello.push(frame(1, format!("{{\"t\":\"grid\",\"id\":\"{}\",\"leds\":[{}]}}", id, leds_json(leds)).as_bytes())); }

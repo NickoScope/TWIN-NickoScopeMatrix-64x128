@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NickoScope Twin</title>
+<style>
+  /* One deliberate world: a dark room with the panel in it. */
+  :root {
+    --room: #0d0e10;
+    --bench: #15171a;
+    --rule: #25282d;
+    --ink: #e7e4dc;
+    --muted: #8b9098;
+    --amber: #ffb547;
+    --ok: #6fd08c;
+    --warn: #f0b429;
+    --bad: #f0645a;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--room); color: var(--ink); font: 14px/1.45 var(--sans); }
+  header { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; padding: 14px 20px; border-bottom: 1px solid var(--rule); }
+  header h1 { font-size: 17px; font-weight: 600; letter-spacing: .02em; margin: 0; }
+  header h1 span { color: var(--amber); }
+  .chip { font: 12px var(--mono); color: var(--muted); display: inline-flex; gap: 6px; align-items: center; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); }
+  .dot.on { background: var(--ok); }
+  .stats { margin-left: auto; display: flex; gap: 18px; font: 12px var(--mono); color: var(--muted); font-variant-numeric: tabular-nums; }
+  .stats b { color: var(--ink); font-weight: 500; }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 20px; padding: 20px; max-width: 1500px; margin: 0 auto; }
+  @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
+  .stage { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+  .frame { background: #050506; border-radius: 6px; padding: 18px; box-shadow: 0 0 0 1px #000, 0 0 0 7px #1b1d21, 0 20px 60px rgba(0,0,0,.6); }
+  canvas#panel { display: block; width: 100%; aspect-ratio: 2 / 1; background: #030304; border-radius: 2px; }
+  .look { display: flex; gap: 18px; flex-wrap: wrap; align-items: center; font-size: 12px; color: var(--muted); }
+  .look label { display: inline-flex; gap: 8px; align-items: center; }
+  .look input[type=range] { width: 110px; accent-color: var(--amber); }
+  .note { font-size: 12px; color: var(--muted); max-width: 70ch; }
+  aside { display: flex; flex-direction: column; gap: 16px; }
+  section.card { background: var(--bench); border: 1px solid var(--rule); border-radius: 10px; padding: 14px; }
+  section.card h2 { margin: 0 0 10px; font-size: 11px; font-weight: 600; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
+  /* the remote: a slab of plastic with ten learned buttons */
+  .remote { background: linear-gradient(#1f2226, #181a1d); border-radius: 22px; padding: 16px 14px 18px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; box-shadow: inset 0 1px 0 #2c3036; }
+  .remote .ir { grid-column: 1 / -1; display: flex; justify-content: center; margin-bottom: 2px; }
+  .remote .ir i { width: 18px; height: 8px; border-radius: 4px; background: #2a1414; transition: background .08s; }
+  .remote .ir i.tx { background: #ff3b30; box-shadow: 0 0 10px #ff3b30; }
+  button { font: 12px var(--sans); color: var(--ink); background: #2a2e34; border: 1px solid #353a41; border-radius: 12px; padding: 10px 6px; cursor: pointer; user-select: none; touch-action: none; }
+  button:hover { background: #323740; }
+  button:active, button.held { background: #3d434c; transform: translateY(1px); }
+  button:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+  .remote button.round { border-radius: 50%; aspect-ratio: 1; padding: 0; }
+  .remote button.accent { background: #3a2f1c; border-color: #5a4726; color: var(--amber); }
+  .remote small { display: block; font-size: 10px; color: var(--muted); margin-top: 2px; font-family: var(--mono); }
+  .knobrow { display: grid; grid-template-columns: 1fr auto 1fr; gap: 12px; align-items: center; }
+  .knob { width: 96px; height: 96px; border-radius: 50%; background: radial-gradient(circle at 35% 30%, #4a4f57, #202328 70%); box-shadow: 0 6px 18px rgba(0,0,0,.6), inset 0 0 0 6px #2b2f35; position: relative; cursor: grab; touch-action: none; }
+  .knob::after { content: ""; position: absolute; left: 50%; top: 10px; width: 4px; height: 18px; margin-left: -2px; border-radius: 2px; background: var(--amber); transform-origin: 2px 38px; transform: rotate(var(--a, 0deg)); }
+  .knob.down { box-shadow: 0 2px 6px rgba(0,0,0,.6), inset 0 0 0 6px #3a3f46; }
+  .hint { font-size: 11px; color: var(--muted); margin-top: 8px; }
+  pre#console { margin: 0; height: 220px; overflow: auto; font: 11px/1.4 var(--mono); color: #cfd3d8; background: #0a0b0c; border-radius: 6px; padding: 8px; white-space: pre-wrap; word-break: break-word; }
+  form.line { display: flex; gap: 6px; margin-top: 8px; }
+  form.line input { flex: 1; min-width: 0; font: 12px var(--mono); color: var(--ink); background: #0a0b0c; border: 1px solid var(--rule); border-radius: 6px; padding: 7px 8px; }
+  a { color: var(--amber); }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>NickoScope <span>Twin</span></h1>
+  <span class="chip"><i class="dot" id="conn"></i><span id="connText">connecting</span></span>
+  <span class="chip" id="board">board —</span>
+  <div class="stats">
+    <span>time <b id="stTime">—</b></span>
+    <span>refresh windows/s <b id="stFps">—</b></span>
+    <span>behind <b id="stBehind">—</b></span>
+  </div>
+</header>
+<main>
+  <div class="stage">
+    <div class="frame"><canvas id="panel" width="1024" height="512" aria-label="The LED panel as the real firmware drives it"></canvas></div>
+    <div class="look">
+      <label>Exposure <input id="exposure" type="range" min="0.25" max="4" step="0.05" value="1"></label>
+      <label>GOB glow <input id="glow" type="range" min="0" max="1" step="0.05" value="0.55"></label>
+      <label><input id="dots" type="checkbox" checked> LED dots</label>
+      <button id="snap" type="button">Save PNG</button>
+    </div>
+    <p class="note">Light is counted per LED from the HUB75 bitstream the firmware clocks out of LCD_CAM, over whole refreshes: 1.0 is an LED lit for its entire row slot of the 1/32 scan. Glow, dot size and exposure are a look, not yet calibrated against photos of the panel.</p>
+  </div>
+  <aside>
+    <section class="card">
+      <h2>IR remote</h2>
+      <div class="remote" id="remote">
+        <div class="ir"><i id="irled"></i></div>
+      </div>
+      <p class="hint">Click to press; hold to send NEC repeat frames. The receiver on GPIO0 decodes them in the firmware, as on the panel.</p>
+    </section>
+    <section class="card">
+      <h2>Knob</h2>
+      <div class="knobrow">
+        <button id="ccw" type="button" aria-label="Turn left">⟲</button>
+        <div class="knob" id="knob" role="button" tabindex="0" aria-label="Knob: drag or scroll to turn, click to press"></div>
+        <button id="cw" type="button" aria-label="Turn right">⟳</button>
+      </div>
+      <p class="hint">Scroll or drag to turn a detent at a time; click to press, hold for a long press.</p>
+    </section>
+    <section class="card">
+      <h2>Console · USB</h2>
+      <pre id="console"></pre>
+      <form class="line" id="line"><input id="lineIn" placeholder="ir help" autocomplete="off"><button type="submit">Send</button></form>
+      <p class="hint" id="portal"></p>
+    </section>
+  </aside>
+</main>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const canvas = $('panel'), ctx = canvas.getContext('2d');
+  const W = 128, H = 64;
+  const led = document.createElement('canvas'); led.width = W; led.height = H;
+  const lctx = led.getContext('2d');
+  const img = lctx.createImageData(W, H);
+  let light = new Uint16Array(W * H * 3);
+  let dirty = true, windows = 0, lastCount = 0, lastT = performance.now();
+
+  // sRGB OETF (CSS Color 4, conversions.js lin_sRGB_to_sRGB) as a lookup over linear light
+  const LUT = new Uint8ClampedArray(4097);
+  for (let i = 0; i <= 4096; i++) { const l = i / 4096; LUT[i] = Math.round(255 * (l <= 0.0031308 ? 12.92 * l : 1.055 * Math.pow(l, 1 / 2.4) - 0.055)); }
+
+  // Canvas at device resolution; the dot mask follows its size.
+  let mask = null, dotsLayer = null, glowLayer = null;
+  function resize() {
+    const r = canvas.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+    const w = Math.max(256, Math.round(r.width * dpr)), h = Math.round(w / 2);
+    if (canvas.width === w && mask) return;
+    canvas.width = w; canvas.height = h;
+    const p = w / W;                         // device px per LED (2 mm pitch)
+    mask = document.createElement('canvas'); mask.width = w; mask.height = h;
+    const m = mask.getContext('2d'); m.fillStyle = '#fff';
+    const rad = p * 0.36;                    // LED lens ≈ 0.72 of the pitch (look, uncalibrated)
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { m.beginPath(); m.arc((x + .5) * p, (y + .5) * p, rad, 0, 2 * Math.PI); m.fill(); }
+    dotsLayer = document.createElement('canvas'); dotsLayer.width = w; dotsLayer.height = h;
+    glowLayer = document.createElement('canvas'); glowLayer.width = w; glowLayer.height = h;
+    dirty = true;
+  }
+  new ResizeObserver(resize).observe(canvas);
+
+  function draw() {
+    if (dirty && mask) {
+      dirty = false;
+      const g = parseFloat($('exposure').value), d = img.data;
+      for (let i = 0, j = 0; i < W * H; i++, j += 4) {
+        d[j] = LUT[Math.min(4096, (light[i * 3] * g / 16) | 0)];
+        d[j + 1] = LUT[Math.min(4096, (light[i * 3 + 1] * g / 16) | 0)];
+        d[j + 2] = LUT[Math.min(4096, (light[i * 3 + 2] * g / 16) | 0)];
+        d[j + 3] = 255;
+      }
+      lctx.putImageData(img, 0, 0);
+      const w = canvas.width, h = canvas.height, p = w / W;
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.fillStyle = '#040405'; ctx.fillRect(0, 0, w, h);
+      const glow = parseFloat($('glow').value);
+      if (glow > 0) {                        // GOB epoxy spreads each LED's light (look, uncalibrated)
+        const gc = glowLayer.getContext('2d');
+        gc.clearRect(0, 0, w, h); gc.imageSmoothingEnabled = true;
+        gc.filter = `blur(${(p * 0.9).toFixed(1)}px)`; gc.drawImage(led, 0, 0, w, h); gc.filter = 'none';
+        ctx.globalAlpha = glow; ctx.globalCompositeOperation = 'lighter'; ctx.drawImage(glowLayer, 0, 0);
+        ctx.globalAlpha = 1;
+      }
+      const dc = dotsLayer.getContext('2d');
+      dc.globalCompositeOperation = 'source-over'; dc.clearRect(0, 0, w, h);
+      dc.imageSmoothingEnabled = false; dc.drawImage(led, 0, 0, w, h);
+      if ($('dots').checked) { dc.globalCompositeOperation = 'destination-in'; dc.drawImage(mask, 0, 0); }
+      ctx.globalCompositeOperation = 'lighter'; ctx.drawImage(dotsLayer, 0, 0);
+      ctx.globalCompositeOperation = 'source-over';
+    }
+    const now = performance.now();
+    if (now - lastT > 1000) { $('stFps').textContent = ((windows - lastCount) * 1000 / (now - lastT)).toFixed(0); lastCount = windows; lastT = now; }
+    requestAnimationFrame(draw);
+  }
+  requestAnimationFrame(draw);
+  for (const id of ['exposure', 'glow', 'dots']) $(id).addEventListener('input', () => dirty = true);
+  $('snap').addEventListener('click', () => { const a = document.createElement('a'); a.download = 'twin-panel.png'; a.href = canvas.toDataURL('image/png'); a.click(); });
+
+  // ---- the emulator's WebSocket
+  let ws, con = $('console'), conBuf = '';
+  function send(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
+  function appendConsole(s) {
+    conBuf += s; if (conBuf.length > 60000) conBuf = conBuf.slice(-40000);
+    const atEnd = con.scrollTop + con.clientHeight >= con.scrollHeight - 4;
+    con.textContent = conBuf; if (atEnd) con.scrollTop = con.scrollHeight;
+    const m = /IP Address: ([0-9.]+)/.exec(s); if (m) $('portal').innerHTML = `The firmware got ${m[1]} on the virtual Wi-Fi. With <code>--hostfwd tcp:8080-80</code> its portal is <a href="http://127.0.0.1:8080/" target="_blank" rel="noopener">127.0.0.1:8080</a>.`;
+  }
+  function connect() {
+    ws = new WebSocket(`ws://${location.host}/ws`); ws.binaryType = 'arraybuffer';
+    ws.onopen = () => { $('conn').classList.add('on'); $('connText').textContent = 'running'; };
+    ws.onclose = () => { $('conn').classList.remove('on'); $('connText').textContent = 'stopped'; setTimeout(connect, 1500); };
+    ws.onmessage = (ev) => {
+      if (typeof ev.data === 'string') {
+        let m; try { m = JSON.parse(ev.data); } catch { return; }
+        if (m.t === 'serial' && m.src === 'usb') appendConsole(m.data);
+        else if (m.t === 'board') $('board').textContent = 'board ' + m.name;
+        else if (m.t === 'stat') { $('stTime').textContent = m.time.toFixed(1) + ' s'; $('stBehind').textContent = (m.behind * 1000).toFixed(0) + ' ms'; }
+        return;
+      }
+      const b = new DataView(ev.data);
+      if (b.byteLength < 5) return;
+      if (b.getUint8(0) === 5) {
+        const w = b.getUint16(1, true), h = b.getUint16(3, true);
+        if (w !== W || h !== H) return;
+        light = new Uint16Array(ev.data.slice(5, 5 + w * h * 6));
+        windows++; dirty = true;
+      }
+    };
+  }
+  connect();
+  $('line').addEventListener('submit', (e) => { e.preventDefault(); send({ t: 'serial', line: $('lineIn').value }); $('lineIn').value = ''; });
+
+  // ---- the remote: the owner's ten learned buttons (ir_map.h slots 1..10, functions as bound on the panel)
+  const BUTTONS = [
+    { n: 5, label: 'Power', fn: 'power', code: 0xFF28D7, cls: 'accent' },
+    { n: 8, label: 'Home', fn: 'home', code: 0xFF12ED },
+    { n: 7, label: 'Carousel', fn: 'carousel', code: 0xFF19E6 },
+    { n: 1, label: '◀', fn: 'ccw', code: 0xFF708F, cls: 'round' },
+    { n: 3, label: 'OK', fn: 'ok', code: 0xFFE01F, cls: 'round accent' },
+    { n: 2, label: '▶', fn: 'cw', code: 0xFF58A7, cls: 'round' },
+    { n: 9, label: 'Bright −', fn: 'bright_down', code: 0xFF40BF },
+    { n: 4, label: 'Long', fn: 'long', code: 0xFF41BE },
+    { n: 6, label: 'Bright +', fn: 'bright_up', code: 0xFFC03F },
+    { n: 10, label: 'Play/Pause', fn: 'media_toggle', code: 0xFFC936 },
+  ];
+  const remote = $('remote');
+  for (const b of BUTTONS) {
+    const el = document.createElement('button'); el.type = 'button'; if (b.cls) el.className = b.cls;
+    el.innerHTML = `${b.label}<small>${b.n}</small>`; el.title = `button ${b.n}, NEC 0x${b.code.toString(16).toUpperCase()}`;
+    if (b.n === 10) el.style.gridColumn = '2';
+    let t0 = 0;
+    const down = (e) => { e.preventDefault(); t0 = performance.now(); el.classList.add('held'); $('irled').classList.add('tx'); send({ t: 'ir', code: '0x' + b.code.toString(16), down: '1' }); };
+    const up = () => { if (!t0) return; t0 = 0; el.classList.remove('held'); $('irled').classList.remove('tx'); send({ t: 'ir', code: '0x' + b.code.toString(16), down: '0' }); };
+    el.addEventListener('pointerdown', down); el.addEventListener('pointerup', up); el.addEventListener('pointerleave', up); el.addEventListener('pointercancel', up);
+    remote.appendChild(el);
+  }
+
+  // ---- the knob
+  const knob = $('knob'); let angle = 0;
+  const turn = (d) => { angle += d * 18; knob.style.setProperty('--a', angle + 'deg'); send({ t: 'knob', d: String(d) }); };
+  $('ccw').addEventListener('click', () => turn(-1)); $('cw').addEventListener('click', () => turn(1));
+  let wheelAcc = 0;
+  knob.addEventListener('wheel', (e) => { e.preventDefault(); wheelAcc += e.deltaY; while (Math.abs(wheelAcc) >= 60) { turn(wheelAcc > 0 ? 1 : -1); wheelAcc -= Math.sign(wheelAcc) * 60; } }, { passive: false });
+  let dragY = null, moved = false;
+  knob.addEventListener('pointerdown', (e) => { knob.setPointerCapture(e.pointerId); dragY = e.clientY; moved = false; knob.classList.add('down'); send({ t: 'knobpress', v: '1' }); });
+  knob.addEventListener('pointermove', (e) => { if (dragY === null) return; const dy = e.clientY - dragY; if (Math.abs(dy) >= 24) { if (!moved) { moved = true; send({ t: 'knobpress', v: '0' }); knob.classList.remove('down'); } turn(dy > 0 ? 1 : -1); dragY = e.clientY; } });
+  const release = () => { if (dragY === null) return; dragY = null; knob.classList.remove('down'); if (!moved) send({ t: 'knobpress', v: '0' }); };
+  knob.addEventListener('pointerup', release); knob.addEventListener('pointercancel', release);
+  knob.addEventListener('keydown', (e) => { if (e.key === 'ArrowLeft') turn(-1); else if (e.key === 'ArrowRight') turn(1); else if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); send({ t: 'knobpress', v: '1' }); setTimeout(() => send({ t: 'knobpress', v: '0' }), 120); } });
+})();
+</script>
+</body>
+</html>

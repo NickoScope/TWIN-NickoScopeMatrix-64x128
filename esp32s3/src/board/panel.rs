@@ -26,8 +26,10 @@ pub struct Panel {
     on_run: u64,            // PCLKs lit with the current latch and address, not yet added
     on: Vec<[u64; 3]>,      // lit PCLKs per LED and channel in this refresh window
     clocks: u64,            // PCLKs in this refresh window
-    window: u64,            // PCLKs per refresh window
-    pub frame: Vec<u16>,    // last finished window, RGB565
+    window: u64,            // PCLKs per refresh window, at least
+    wraps: u64,             // refreshes begun in this window (the row address wrapping to a lower one)
+    pub light: Vec<u16>,    // last finished window: R G B linear light per LED, 65535 = lit all its row slot
+    pub frame: Vec<u16>,    // the same, sRGB-encoded RGB565 for PNGs and plain UIs
     pub frames: u64,
     pub words: u64,
     pub pclk: u64,
@@ -38,8 +40,8 @@ impl Default for Panel { fn default() -> Self { Self::new() } }
 
 impl Panel {
     pub fn new() -> Self {
-        Panel { sr: [0; W], col: 0, latch: [0; W], addr: 0, on_run: 0, on: vec![[0; 3]; W * H], clocks: 0, window: 0,
-                frame: vec![0; W * H], frames: 0, words: 0, pclk: 0, gpio_events: 0 }
+        Panel { sr: [0; W], col: 0, latch: [0; W], addr: 0, on_run: 0, on: vec![[0; 3]; W * H], clocks: 0, window: 0, wraps: 0,
+                light: vec![0; W * H * 3], frame: vec![0; W * H], frames: 0, words: 0, pclk: 0, gpio_events: 0 }
     }
 
     fn flush_run(&mut self) {
@@ -60,17 +62,17 @@ impl Panel {
         self.flush_run();
         // The most light a 1/32-scan LED can give: lit through its whole row slot.
         let full = (self.clocks as f64 / SCAN as f64).max(1.0);
+        // sRGB OETF (CSS Color 4, conversions.js, lin_sRGB_to_sRGB)
+        let enc = |l: f64| -> f64 { if l <= 0.0031308 { 12.92 * l } else { 1.055 * l.powf(1.0 / 2.4) - 0.055 } };
         for (i, c) in self.on.iter_mut().enumerate() {
-            let enc = |v: u64| -> f64 {
-                let l = (v as f64 / full).min(1.0);
-                // sRGB OETF (CSS Color 4, conversions.js, lin_sRGB_to_sRGB)
-                if l <= 0.0031308 { 12.92 * l } else { 1.055 * l.powf(1.0 / 2.4) - 0.055 }
-            };
-            let (r, g, b) = (enc(c[0]), enc(c[1]), enc(c[2]));
+            let l = [0, 1, 2].map(|k| (c[k] as f64 / full).min(1.0));
+            for k in 0..3 { self.light[i * 3 + k] = (l[k] * 65535.0 + 0.5) as u16; }
+            let (r, g, b) = (enc(l[0]), enc(l[1]), enc(l[2]));
             self.frame[i] = (((r * 31.0 + 0.5) as u16) << 11) | (((g * 63.0 + 0.5) as u16) << 5) | ((b * 31.0 + 0.5) as u16);
             *c = [0; 3];
         }
         self.clocks = 0;
+        self.wraps = 0;
         self.frames += 1;
     }
 
@@ -81,10 +83,17 @@ impl Panel {
             self.col += 1;
             let addr = ((w >> 8) & 0x1f) as usize;
             if w & 0x40 != 0 { self.flush_run(); self.latch = self.sr; self.col = 0; }
-            if addr != self.addr { self.flush_run(); self.addr = addr; }
+            if addr != self.addr {
+                self.flush_run();
+                // A refresh begins where the scan wraps to a lower row. The window closes on one,
+                // so it holds whole refreshes and every row the same number of times.
+                if addr < self.addr { self.wraps += 1; if self.clocks >= self.window && self.wraps >= 2 { self.finish_window(); self.wraps = 1; } }
+                self.addr = addr;
+            }
             if w & 0x80 == 0 { self.on_run += 1; }
             self.clocks += 1;
-            if self.clocks >= self.window { self.finish_window(); }
+            // A stream with no scan (no address change for 4 windows) still shows, as darkness.
+            if self.clocks >= self.window.saturating_mul(4) { self.finish_window(); }
         }
     }
 }
@@ -101,6 +110,7 @@ impl BoardModel for Panel {
         self.feed(&words);
     }
     fn display(&self) -> Option<(u32, u32, Vec<u16>, u64)> { Some((W as u32, H as u32, self.frame.clone(), self.frames)) }
+    fn display_light(&self) -> Option<(u32, u32, Vec<u16>, u64)> { Some((W as u32, H as u32, self.light.clone(), self.frames)) }
     fn display_version(&self) -> u64 { self.frames }
     fn display_frames(&self) -> u64 { self.frames }
     fn report(&self) -> String {
