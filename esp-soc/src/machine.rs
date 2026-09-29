@@ -96,6 +96,10 @@ pub struct Machine<S: Soc> {
     cost: Option<Box<dyn CostModel>>,
     model_accesses: Vec<MemoryAccess>,
     approximate_jit_timing: Option<(u32, u32)>,
+    /// A fractional part for that CPI, in 1/256ths: rounds alternate between CPI and CPI + 1 so
+    /// that the average is CPI + frac/256 (error diffusion), and each round stays whole.
+    approximate_cpi_frac: u32,
+    approximate_cpi_acc: u32,
     approximate_jit_frontiers: bool,
     model_ready_at: Vec<u64>,
     model_stop: Option<Stop>,
@@ -149,7 +153,7 @@ impl<S: Soc> Machine<S> {
             console: Console { all: Vec::new(), usb: Vec::new(), uart0: Vec::new(), mask: 3, prefix: false, capture: false },
             web: None, ws: WebState { last_push_cycles: 0, push_interval: 0, audio_sent: 0, ring_updates: 0, grid_updates: Vec::new(), px_pending: 0, px_sent: 0, px_deferred: false, cam_pushed: u64::MAX, cam_sent: false },
             rt: Realtime { enabled: false, wall_start: None, last_check: 0, behind: 0.0, resyncs: 0, speed: None, speed_mark: None, log: false, log_last: None, log_insns: (0, 0) },
-            debug_rom: false, cost: None, model_accesses: Vec::new(), approximate_jit_timing: None, approximate_jit_frontiers: false, model_ready_at: vec![0; S::CORES], model_stop: None, model_attach_error: None,
+            debug_rom: false, cost: None, model_accesses: Vec::new(), approximate_jit_timing: None, approximate_cpi_frac: 0, approximate_cpi_acc: 0, approximate_jit_frontiers: false, model_ready_at: vec![0; S::CORES], model_stop: None, model_attach_error: None,
         }
     }
 
@@ -202,6 +206,13 @@ impl<S: Soc> Machine<S> {
         if !(1..=256).contains(&cpi) || !(1..=4096).contains(&quantum) { return Err("CPI must be 1..256 and quantum 1..4096".into()); }
         self.approximate_jit_timing = Some((cpi, quantum));
         for core in &mut self.cores { core.set_approximate_cpi(cpi); }
+        Ok(())
+    }
+    /// The fractional part of the uniform CPI, in 1/256ths (0..=255); see `approximate_cpi_frac`.
+    pub fn set_approximate_cpi_fraction(&mut self, frac: u32) -> Result<(), String> {
+        if self.approximate_jit_timing.is_none() { return Err("set the approximate JIT timing first".into()); }
+        if frac > 255 { return Err("the fraction is in 1/256ths: 0..=255".into()); }
+        self.approximate_cpi_frac = frac;
         Ok(())
     }
     pub fn has_observer(&self, name: &str) -> bool { self.observers.iter().any(|o| o.name() == name) }
@@ -516,7 +527,8 @@ impl<S: Soc> Machine<S> {
 
     fn run_unmodeled<const APPROXIMATE: bool>(&mut self, max_insns: u64) -> Stop {
         assert!(self.quantum != 0, "scheduling quantum must be nonzero");
-        let (cpi, max_quantum) = if APPROXIMATE { self.approximate_jit_timing.unwrap() } else { (1, self.quantum as u32) };
+        let (cpi_base, max_quantum) = if APPROXIMATE { self.approximate_jit_timing.unwrap() } else { (1, self.quantum as u32) };
+        let mut cpi = cpi_base;
         self.stub_bloom = self.stubs.keys().fold(0, |m, &pc| m | pc_bit(pc));
         self.probe_bloom = self.fn_probes.keys().fold(0, |m, &pc| m | pc_bit(pc));
         for c in &mut self.cores {
@@ -634,6 +646,11 @@ impl<S: Soc> Machine<S> {
                         continue;
                     } else { self.bb_stats[6] += 1; }
                 }
+            }
+            if APPROXIMATE && self.approximate_cpi_frac != 0 {
+                self.approximate_cpi_acc += self.approximate_cpi_frac;
+                let next = if self.approximate_cpi_acc >= 256 { self.approximate_cpi_acc -= 256; cpi_base + 1 } else { cpi_base };
+                if next != cpi { cpi = next; for core in &mut self.cores { core.set_approximate_cpi(cpi); } }
             }
             let quantum = if APPROXIMATE {
                 // An instruction can overrun the deadline by at most CPI-1 cycles.

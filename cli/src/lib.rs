@@ -67,7 +67,7 @@ pub struct Opts {
     pub approximate_cache: bool,
     pub chip: String,
     pub rom: Option<PathBuf>, pub bootloader: Option<String>, pub ptable: Option<String>, pub app: Option<String>, pub elfs: Vec<String>,
-    pub flash_image: Option<String>, pub flash_at: Vec<String>, pub boot: Option<String>, pub flash_mb: Option<usize>, pub psram_mb: Option<usize>, pub flash_id: Option<[u8; 3]>, pub flash_persist: Option<String>, pub cpi: Option<u32>, pub serial_hex: Vec<u8>,
+    pub flash_image: Option<String>, pub flash_at: Vec<String>, pub boot: Option<String>, pub flash_mb: Option<usize>, pub psram_mb: Option<usize>, pub flash_id: Option<[u8; 3]>, pub flash_persist: Option<String>, pub cpi: Option<(u32, u32)>, pub serial_hex: Vec<u8>,
     pub mac: Option<[u8; 6]>, pub strap: Option<u32>, pub reset_cause: Option<u32>, pub efuse_regs: Option<String>, pub regs_init: Option<String>,
     pub board: String, pub wifi: Option<String>, pub net: String, pub hostfwd: Vec<esp_soc::nat::HostFwd>, pub cam_image: Option<String>, pub cam_fps: f64,
     pub spi2_timing: bool, pub measured_te: bool,
@@ -133,7 +133,9 @@ pub fn parse(args: &[String], default_chip: &str) -> Opts {
             "--flash-persist" => o.flash_persist = Some(next()),
             // Uniform cycles per instruction on the JIT path (set_approximate_jit_timing): a rough
             // way to bring the emulated CPU's pace toward a chip whose memory stalls it.
-            "--cpi" => o.cpi = Some(next().parse().unwrap_or_else(|_| usage_error("--cpi: 1..256"))),
+            // A fraction is allowed (2.6): rounds alternate between 2 and 3 cycles an instruction.
+            "--cpi" => { let v: f64 = next().parse().unwrap_or_else(|_| usage_error("--cpi: 1.0..256")); if !(1.0..=256.0).contains(&v) { usage_error("--cpi: 1.0..256"); }
+                         let base = v.floor() as u32; o.cpi = Some((base, ((v - base as f64) * 256.0).round().min(255.0) as u32)); }
             "--console" => o.console = Some(next()),
             "--console-prefix" => o.console_prefix = true,
             "--realtime" => o.realtime = true,
@@ -364,7 +366,11 @@ fn run<S: Soc>(mut m: Machine<S>, o: &Opts) {
         m.set_cost_model(cost).unwrap_or_else(|e| usage_error(&format!("--approximate-timing: {e}")));
         eprintln!("[emu] APPROXIMATE timing: {:?}; use --boot rom; accuracy unvalidated", model.config);
     }
-    if let Some(cpi) = o.cpi { m.set_approximate_jit_timing(cpi, 256).unwrap_or_else(|e| usage_error(&format!("--cpi: {e}"))); eprintln!("[emu] {} cycles per instruction (uniform, JIT)", cpi); }
+    if let Some((cpi, frac)) = o.cpi {
+        m.set_approximate_jit_timing(cpi, 256).unwrap_or_else(|e| usage_error(&format!("--cpi: {e}")));
+        m.set_approximate_cpi_fraction(frac).unwrap_or_else(|e| usage_error(&format!("--cpi: {e}")));
+        eprintln!("[emu] {:.3} cycles per instruction (uniform, JIT)", cpi as f64 + frac as f64 / 256.0);
+    }
     let boot = prepare(&mut m, o);
     let t0 = std::time::Instant::now();
     m.web_restart = !o.no_reboot;
