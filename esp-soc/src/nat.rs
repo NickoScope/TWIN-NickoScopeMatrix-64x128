@@ -456,8 +456,9 @@ impl Nat {
             // A SYN on a synchronized connection gets a challenge ACK <SEQ=SND.NXT><ACK=RCV.NXT>
             // (RFC 9293 section 3.10.7.4, fourth step, after RFC 5961). A guest that no longer has
             // this connection sits in SYN-SENT and answers the bare ACK with a reset, then sends
-            // its SYN again at once (lwIP tcp_in.c SYN_SENT, "possibly a half-open connection"):
-            // the reset closes this flow and the SYN opens a new one.
+            // its SYN again at once (lwIP tcp_in.c SYN_SENT, "possibly a half-open connection", as
+            // read in IDF 5.5.4's copy; the firmware's IDF 4.4 esp-lwip not re-read): the reset
+            // closes this flow and the SYN opens a new one.
             return if matches!(c.transport, Transport::Connected(_)) { vec![c.segment(ACK, &[], c.our_seq)] } else { Vec::new() };
         }
         // SYN-SENT accepts only a SYN-ACK or a reset (RFC 9293 section 3.10.7.3).
