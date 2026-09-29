@@ -53,7 +53,7 @@ impl Panel {
     fn close_window(&mut self) {
         let full = (self.acc_clocks as f64 / SCAN as f64).max(1.0);
         for (i, a) in self.acc.iter_mut().enumerate() {
-            for k in 0..3 { self.light[i * 3 + k] = ((a[k] as f64 / full).min(1.0) * 65535.0 + 0.5) as u16; }
+            for (l, v) in self.light[i * 3..i * 3 + 3].iter_mut().zip(a.iter()) { *l = ((*v as f64 / full).min(1.0) * 65535.0 + 0.5) as u16; }
             self.last.on_clk[i] = [a[0].min(u32::MAX as u64) as u32, a[1].min(u32::MAX as u64) as u32, a[2].min(u32::MAX as u64) as u32];
             *a = [0; 3];
         }
@@ -74,7 +74,7 @@ impl BoardModel for Panel {
         if pclk_hz != self.pclk { self.pclk = pclk_hz; self.window = (pclk_hz / 60).max(1); }   // an eye's 1/60 s
         let mut words = std::mem::take(&mut self.words16);
         words.clear();
-        words.extend(data.chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])));
+        words.extend(data.as_chunks::<2>().0.iter().map(|p| u16::from_le_bytes(*p)));
         self.words += words.len() as u64;
         if let Some(r) = self.dec.feed_segment(&words, eof) { self.add_refresh(r); }
         self.words16 = words;
