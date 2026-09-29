@@ -88,7 +88,7 @@
     <div class="frame"><canvas id="panel" width="1024" height="512" aria-label="Светодиодная панель так, как её ведёт настоящая прошивка"></canvas></div>
     <div class="look">
       <label>Экспозиция <input id="exposure" type="range" min="0.25" max="4" step="0.05" value="1"></label>
-      <label>Свечение GOB <input id="glow" type="range" min="0" max="1" step="0.05" value="0.55"></label>
+      <label>Свечение GOB <input id="glow" type="range" min="0" max="1" step="0.05" value="0"></label>
       <label><input id="dots" type="checkbox" checked> Точки светодиодов</label>
       <label>Смотрит <select id="shutter">
         <option value="eye">глаз (1/60 с)</option>
@@ -99,7 +99,7 @@
       </select></label>
       <button id="snap" type="button">Сохранить PNG</button>
     </div>
-    <p class="note">Свет каждого светодиода считается по потоку HUB75, который прошивка выводит через LCD_CAM, за целые кадры развёртки: 1,0 — светодиод горел всё время своей строки при развёртке 1/32. Свечение, размер точек и экспозиция — пока на глаз, по фото панели ещё не выверены.</p>
+    <p class="note">Свет каждого светодиода считается по потоку HUB75, который прошивка выводит через LCD_CAM, за целые кадры развёртки: 1,0 — светодиод горел всё время своей строки при развёртке 1/32. Свечение эпоксидного слоя (GOB) по умолчанию выключено: его сила и радиус взяты на глаз, по фото панели ещё не выверены. Ползунок «Свечение GOB» включает его.</p>
   </div>
   <aside>
     <section class="card">
@@ -274,7 +274,17 @@ void main() {
     requestAnimationFrame(draw);
   }
   requestAnimationFrame(draw);
-  for (const id of ['exposure', 'glow', 'dots']) $(id).addEventListener('input', () => dirty = true);
+  // The look is the viewer's choice and stays across reloads (this browser only). Glow is off by
+  // default: its share and spread are not calibrated against photos of the panel, and at 0.55 it
+  // read as a blur on every effect (owner, 2026-09-29 19:07).
+  const LOOK = 'twin-look-v2';
+  try {
+    const saved = JSON.parse(localStorage.getItem(LOOK) || '{}');
+    for (const id of ['exposure', 'glow']) if (typeof saved[id] === 'string') $(id).value = saved[id];
+    if (typeof saved.dots === 'boolean') $('dots').checked = saved.dots;
+  } catch (e) { /* no storage: defaults */ }
+  const keepLook = () => { try { localStorage.setItem(LOOK, JSON.stringify({ exposure: $('exposure').value, glow: $('glow').value, dots: $('dots').checked })); } catch (e) {} };
+  for (const id of ['exposure', 'glow', 'dots']) $(id).addEventListener('input', () => { dirty = true; keepLook(); });
   // A short exposure catches only the rows the 1/32 scan lights meanwhile: the bands a phone films.
   $('shutter').addEventListener('change', (e) => send({ t: 'input', line: 'shutter ' + e.target.value }));
   $('snap').addEventListener('click', () => { const a = document.createElement('a'); a.download = 'twin-panel.png'; a.href = canvas.toDataURL('image/png'); a.click(); });
