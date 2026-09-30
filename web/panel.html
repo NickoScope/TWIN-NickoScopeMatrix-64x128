@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title data-i18n="title">NickoScope panel twin</title>
+<!-- the tab's icon, inline: the engine's web server has no /favicon.ico (a 404 in the console on every load) -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%2315171a'/%3E%3Cg fill='%23ffb547'%3E%3Ccircle cx='3.5' cy='6' r='1.3'/%3E%3Ccircle cx='6.5' cy='6' r='1.3'/%3E%3Ccircle cx='9.5' cy='6' r='1.3'/%3E%3Ccircle cx='12.5' cy='6' r='1.3'/%3E%3Ccircle cx='3.5' cy='10' r='1.3'/%3E%3Ccircle cx='6.5' cy='10' r='1.3'/%3E%3Ccircle cx='9.5' cy='10' r='1.3'/%3E%3Ccircle cx='12.5' cy='10' r='1.3'/%3E%3C/g%3E%3C/svg%3E">
 <style>
   /* One deliberate world: a dark room with the panel in it. */
   :root {
@@ -295,11 +297,18 @@
   };
   // What the script writes, kept as state so a switch can say it again in the other language.
   let connState = 'conn.connecting', boardName = null, stat = null, portalAt = null;
+  let portalGuess = 0;   // tries left at NAT_PORTAL without an address from the console (appendConsole, poll)
   const remoteKeys = [];   // [button, BUTTONS entry] of the remote, built further down
   let renderHelp = () => {}, pokeHelp = () => {};   // the "This screen" block, set up further down
   // Where the firmware's portal answers: ?portal=PORT (on this page's host) or ?portal=HOST[:PORT] when
   // the twin runs with another --http or the page cannot see the console's IP Address line; else the
-  // console's line (appendConsole), else twin.py's default --http 8080 on this host.
+  // console's line (appendConsole): 10.0.2.x is the engine's own NAT, whose port 80 twin.py run and the
+  // Mac app forward to 127.0.0.1:8080 (NAT_PORTAL: twin.py's default --http, the app's default httpPort;
+  // neither tells the page another port, so another one comes as ?portal=), any other address is the
+  // twin's own on the home network (--lan, the app's bridge). Until one of these is known the page asks
+  // the portal nothing: on the home network there is no 127.0.0.1:8080, and every "This screen" poll
+  // there was an ERR_CONNECTION_REFUSED in the page's console (full test, 2026-09-30).
+  const NAT_PORTAL = 'http://127.0.0.1:8080/';
   const portalParam = (() => {
     const v = new URLSearchParams(location.search).get('portal') || '';
     if (/^\d{1,5}$/.test(v)) return `http://${location.hostname}:${v}/`;
@@ -486,29 +495,57 @@ void main() {
 
   // ---- the emulator's WebSocket
   let ws, con = $('console'), conBuf = '';
+  let conLine = '', replay = false;   // the console line still under way; the next usb chunk is the replay
   function send(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
-  function appendConsole(s) {
+  // The firmware says where it is in one console line, "IP Address: a.b.c.d\r\n" (network.cpp: a print,
+  // then a println of WiFi.localIP()). The serial chunks end anywhere, mid-line and mid-address: a chunk
+  // ending in "IP Address: 192.168" once gave the page the address "192.168", which the browser takes
+  // for 192.0.0.168 (full test, 2026-09-30). So the console is read in whole lines, the text after the
+  // last newline waiting for the next chunk, and only a whole dotted quad replaces the address known.
+  const OCTET = '(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)', IPV4 = new RegExp(`^${OCTET}(?:\\.${OCTET}){3}$`);
+  function addressIn(s) {
+    const lines = (conLine + s).split('\n');
+    // the IP line is 28 characters at most, so the end of a longer line under way is all it can need
+    conLine = lines.pop().slice(-64);
+    let ip = null;
+    for (const line of lines) {
+      const m = /IP Address: ([0-9.]+)\r?$/.exec(line);
+      if (m && IPV4.test(m[1]) && m[1] !== '0.0.0.0') ip = m[1];
+    }
+    return ip;
+  }
+  // The engine replays the end of the USB console to a new page: what it keeps, 48 to 64 KB (machine.rs
+  // cuts it to 49152 bytes past 65536). A boot prints its IP line some 10 KB in (one boot measured,
+  // 2026-09-30), so a replay this long without one has lost it: then the page tries NAT_PORTAL, as it
+  // always did, and stays with it only if it answers (poll).
+  const REPLAY_CLIPPED = 32768;
+  function appendConsole(s, replayed) {
     conBuf += s; if (conBuf.length > 60000) conBuf = conBuf.slice(-40000);
     const atEnd = con.scrollTop + con.clientHeight >= con.scrollHeight - 4;
     con.textContent = conBuf; if (atEnd) con.scrollTop = con.scrollHeight;
-    const m = /IP Address: ([0-9.]+)/.exec(s);
-    if (m) {
-      // 10.0.2.x: the engine's own NAT, the portal is forwarded to 127.0.0.1:8080 (twin.py run).
-      // Any other address came from the home router through the bridge (twin.py run --lan).
-      const nat = m[1].startsWith('10.0.2.');
-      const url = portalParam || (nat ? 'http://127.0.0.1:8080/' : `http://${m[1]}/`);
+    const ip = addressIn(s);
+    if (ip) {
+      // 10.0.2.x: the engine's own NAT, the portal is forwarded to NAT_PORTAL (twin.py run, the app).
+      // Any other address came from the home router through the bridge (twin.py run --lan, the app).
+      const nat = ip.startsWith('10.0.2.');
+      const url = portalParam || (nat ? NAT_PORTAL : `http://${ip}/`);
       $('portalLink').href = url;
-      portalAt = { ip: m[1], nat, url }; showPortal();
+      const moved = !portalAt || portalAt.url !== url;
+      portalAt = { ip, nat, url }; showPortal();
+      if (moved) pokeHelp();   // "This screen" asks the portal from now on, or at its new address
+    } else if (replayed && s.length >= REPLAY_CLIPPED && !portalAt && !portalParam) {
+      portalGuess = 3; pokeHelp();
     }
   }
   function connect() {
     ws = new WebSocket(`ws://${location.host}/ws`); ws.binaryType = 'arraybuffer';
-    ws.onopen = () => { $('conn').classList.add('on'); connState = 'conn.running'; showConn(); };
+    // A new connection starts with the replay (web.rs sends the snapshot first): no line carries over.
+    ws.onopen = () => { conLine = ''; replay = true; $('conn').classList.add('on'); connState = 'conn.running'; showConn(); };
     ws.onclose = () => { $('conn').classList.remove('on'); connState = 'conn.stopped'; showConn(); setTimeout(connect, 1500); };
     ws.onmessage = (ev) => {
       if (typeof ev.data === 'string') {
         let m; try { m = JSON.parse(ev.data); } catch { return; }
-        if (m.t === 'serial' && m.src === 'usb') appendConsole(m.data);
+        if (m.t === 'serial' && m.src === 'usb') { appendConsole(m.data, replay); replay = false; }
         else if (m.t === 'board') { boardName = m.name; showBoard(); }
         else if (m.t === 'stat') { stat = m; showStat(); }
         else if (m.t === 'usj') { $('usbClaim').hidden = !m.claimed; $('lineIn').disabled = !!m.claimed; }
@@ -566,7 +603,8 @@ void main() {
   // Every text from the device goes in as textContent, never as markup.
   const help = { doc: null, now: null, seen: false, down: false, clip: null, clipAt: 0, lua: null, luaAt: 0,
                  luaKey: '', heads: new Map(), timer: 0, last: '' };
-  const portalBase = () => (portalAt && portalAt.url) || portalParam || `http://${location.hostname}:8080/`;
+  // null while the portal's address is not known: nothing is asked then (portalParam, appendConsole)
+  const portalBase = () => (portalAt && portalAt.url) || portalParam || (portalGuess > 0 ? NAT_PORTAL : null);
   const pick = (o) => (o && (o[lang] || o.en || Object.values(o)[0])) || null;
   const remoteLabel = (fns) => `${t('help.remote')} ${fns.map((fn) => {
     const b = BUTTONS.find((x) => x.fn === fn);
@@ -596,8 +634,8 @@ void main() {
     return h;
   }
   // Read a script's header and stop: the rest of the file (up to 512 KB) is not needed here.
-  async function readHeader(stem) {
-    const r = await fetch(`${portalBase()}api/lua/source?name=${encodeURIComponent(stem)}`, { cache: 'no-store' });
+  async function readHeader(base, stem) {
+    const r = await fetch(`${base}api/lua/source?name=${encodeURIComponent(stem)}`, { cache: 'no-store' });
     if (!r.ok) throw Error(`HTTP ${r.status}`);
     if (!r.body || !r.body.getReader) return parseHeader(await r.text());
     const reader = r.body.getReader(), dec = new TextDecoder();
@@ -611,50 +649,56 @@ void main() {
     return parseHeader(text);
   }
 
-  async function getJson(path) {
-    const r = await fetch(portalBase() + path, { cache: 'no-store' });
+  async function getJson(base, path) {
+    const r = await fetch(base + path, { cache: 'no-store' });
     if (!r.ok) throw Error(`HTTP ${r.status}`);
     return r.json();
   }
   // The script behind the Lua page on screen: GET /api/lua, uploaded.scripts[] with i == now.lua.
-  async function luaScript(now) {
+  async function luaScript(base, now) {
     const key = `${now.lua}|${now.name}`;
     if (!help.lua || help.luaKey !== key || performance.now() - help.luaAt > 10000) {
       // Each visit to an effect reads its header afresh (poll() ends a visit on any other page): a script
       // deleted and uploaded again under its name, even at the same size, then says what the new one says.
       if (help.luaKey !== key) help.heads.clear();
-      help.lua = await getJson('api/lua'); help.luaKey = key; help.luaAt = performance.now();
+      help.lua = await getJson(base, 'api/lua'); help.luaKey = key; help.luaAt = performance.now();
     }
     const s = ((help.lua.uploaded && help.lua.uploaded.scripts) || []).find((x) => x.i === now.lua);
     if (!s) return null;
     const id = `${s.name}:${s.bytes}`;      // within a visit: a script replaced at another size is read again
     if (!help.heads.has(id)) {
       help.heads.set(id, 'loading');
-      readHeader(s.name).then((h) => help.heads.set(id, h), () => help.heads.set(id, 'unread')).then(() => renderHelp());
+      readHeader(base, s.name).then((h) => help.heads.set(id, h), () => help.heads.set(id, 'unread')).then(() => renderHelp());
     }
     return { stem: s.name, id };
   }
 
   async function poll() {
     clearTimeout(help.timer);
-    if (!help.doc) return;
+    const base = portalBase();
+    if (!help.doc || !base) return;   // no address yet: appendConsole pokes when it has one
     if (!document.hidden) {
       try {
-        const j = await getJson('api/panel');
+        const j = await getJson(base, 'api/panel');
         const now = j.now || {};
         if (now.key === 'clock' && now.mode === 'ambient') {
           if (performance.now() - help.clipAt > 5000) {
             help.clipAt = performance.now();
-            help.clip = await getJson('api/clips').catch(() => null);   // no SD clips in the build: 404
+            help.clip = await getJson(base, 'api/clips').catch(() => null);   // no SD clips in the build: 404
           }
         } else help.clip = null;
         now.clip = !!(help.clip && help.clip.playing);
         // GET /api/lua refused a moment (a 503): the script seen on this page a poll ago still stands
         const was = help.now && help.now.key === 'lua' && help.now.lua === now.lua ? help.now.script : null;
         if (now.key !== 'lua') help.luaKey = '';   // the visit to an effect is over
-        now.script = now.key === 'lua' ? await luaScript(now).catch(() => was) : null;
+        now.script = now.key === 'lua' ? await luaScript(base, now).catch(() => was) : null;
         help.now = now; help.seen = true; help.down = false;
-      } catch (e) { help.down = true; }
+      } catch (e) {
+        // NAT_PORTAL guessed and never answered: a few tries (a busy firmware's 503 fails like no port at
+        // all), then it is left alone, as a twin on the home network has no such port.
+        if (base === NAT_PORTAL && !help.seen && !portalAt && !portalParam && --portalGuess <= 0) { renderHelp(); return; }
+        help.down = true;
+      }
       renderHelp();
     }
     help.timer = setTimeout(poll, 1500);
@@ -669,7 +713,7 @@ void main() {
   // What the block says: {name, id, what, flags[], controls[[label, text]], functions[]}
   function model() {
     const now = help.now;
-    if (!now) return { name: t('help.waiting'), id: portalBase().replace(/^http:\/\//, '').replace(/\/$/, ''),
+    if (!now) return { name: t('help.waiting'), id: (portalBase() || '').replace(/^http:\/\//, '').replace(/\/$/, ''),
                        what: '', flags: [], controls: [], functions: [] };
     const out = { name: '', id: '', what: '', flags: [], controls: [], functions: [] };
     const add = (list) => { for (const c of list || []) out.controls.push([controlLabel(c), pick(c)]); };
