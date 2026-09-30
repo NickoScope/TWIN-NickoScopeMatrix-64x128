@@ -1,6 +1,7 @@
 # TWIN-NickoScopeMatrix-64x128: a virtual twin of an LED panel
 
-This fork of [esp32sim](https://github.com/joakimeriksson/esp32sim) by Joakim Eriksson runs the
+This fork of [esp32sim](https://github.com/joakimeriksson/esp32sim) by Joakim Eriksson (@joakimeriksson) and
+Alice (@aliceisjustplaying) runs the
 unmodified firmware of [AnimatedPixelClock](https://github.com/NickoScope/AnimatedPixelClock) for a
 Waveshare ESP32-S3-RGB-Matrix board driving a 128x64 HUB75 panel. Mac users see on screen what the
 LEDs would show, and can operate the IR remote and the knob. The fork's work is on the branch
@@ -33,3 +34,20 @@ LEDs would show, and can operate the IR remote and the knob. The fork's work is 
 How to run the twin, and the design with its sources: `tools/twin/` in AnimatedPixelClock.
 
 Upstream's license (MIT) applies to everything here.
+
+## Thanks
+
+To Joakim Eriksson and Alice for esp32sim: it boots the real ESP32-S3 ROM and runs Espressif's own Wi-Fi
+blob, so an unmodified Arduino firmware image runs here as it does on the board. Everything in this branch
+builds on that.
+
+And to the other works the twin uses:
+- the firmware, [AnimatedPixelClock](https://github.com/Keralots/AnimatedPixelClock) by Keralots;
+- [ESP32-HUB75-MatrixPanel-DMA](https://github.com/mrcodetastic/ESP32-HUB75-MatrixPanel-DMA) by mrcodetastic, whose output the `hub75` crate decodes;
+- Espressif, for the ROM ELFs ([esp-rom-elfs](https://github.com/espressif/esp-rom-elfs)), ESP-IDF, the Technical Reference Manual, esptool and esptool-js;
+- [ESP Web Tools](https://github.com/esphome/esp-web-tools) (ESPHome) and Improv Wi-Fi, which the web flasher runs;
+- [socket_vmnet](https://github.com/lima-vm/socket_vmnet) (Lima), the bridge to the home network.
+
+The full list, with the firmware's libraries, is in the firmware repository:
+https://github.com/NickoScope/AnimatedPixelClock/blob/main/tools/twin/README.md#authors-and-thanks
+
