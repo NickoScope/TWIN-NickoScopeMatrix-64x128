@@ -620,11 +620,14 @@ void main() {
   async function luaScript(now) {
     const key = `${now.lua}|${now.name}`;
     if (!help.lua || help.luaKey !== key || performance.now() - help.luaAt > 10000) {
+      // Each visit to an effect reads its header afresh (poll() ends a visit on any other page): a script
+      // deleted and uploaded again under its name, even at the same size, then says what the new one says.
+      if (help.luaKey !== key) help.heads.clear();
       help.lua = await getJson('api/lua'); help.luaKey = key; help.luaAt = performance.now();
     }
     const s = ((help.lua.uploaded && help.lua.uploaded.scripts) || []).find((x) => x.i === now.lua);
     if (!s) return null;
-    const id = `${s.name}:${s.bytes}`;      // a script uploaded again under its name is read again
+    const id = `${s.name}:${s.bytes}`;      // within a visit: a script replaced at another size is read again
     if (!help.heads.has(id)) {
       help.heads.set(id, 'loading');
       readHeader(s.name).then((h) => help.heads.set(id, h), () => help.heads.set(id, 'unread')).then(() => renderHelp());
@@ -648,6 +651,7 @@ void main() {
         now.clip = !!(help.clip && help.clip.playing);
         // GET /api/lua refused a moment (a 503): the script seen on this page a poll ago still stands
         const was = help.now && help.now.key === 'lua' && help.now.lua === now.lua ? help.now.script : null;
+        if (now.key !== 'lua') help.luaKey = '';   // the visit to an effect is over
         now.script = now.key === 'lua' ? await luaScript(now).catch(() => was) : null;
         help.now = now; help.seen = true; help.down = false;
       } catch (e) { help.down = true; }
@@ -672,7 +676,7 @@ void main() {
     const fns = (f) => (f && (f[lang] || f.en)) || [];
     const s = screenFor(now);
     if (s && s.id === 'lua') {
-      const sc = now.script, h = sc && help.heads.get(sc.id), extra = help.doc.effects && help.doc.effects[now.name];
+      const sc = now.script, h = sc && (help.heads.get(sc.id) || 'loading'), extra = help.doc.effects && help.doc.effects[now.name];
       out.id = now.name || '';
       if (h && typeof h === 'object' && h.tagged) {
         const mine = (pick(h.control) || []).map((l) => { const i = l.indexOf(': '); return i > 0 ? [l.slice(0, i), l.slice(i + 2)] : ['', l]; });
