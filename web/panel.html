@@ -496,7 +496,21 @@ void main() {
   // ---- the emulator's WebSocket
   let ws, con = $('console'), conBuf = '';
   let conLine = '', replay = false;   // the console line still under way; the next usb chunk is the replay
-  function send(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
+  function send(o) { if (ws && ws.readyState === 1) { ws.send(JSON.stringify(o)); tellApp(o); } }
+  // The Mac app (TWIN-…, tools/twin/app/main.swift) shows this page in a WKWebView and keeps the twin in step with a
+  // physical panel: told of each gesture a person makes here at once, it reads the twin now rather than within 3 s
+  // ("twinInput" -> SyncEngine.twinPageInput). Only the gestures: a knob turn, the knob's switch released, a remote
+  // button released, BOOT released, RESET. Anywhere else (a browser) there is no such handler, and nothing is sent.
+  function tellApp(o) {
+    const h = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.twinInput;
+    if (!h) return;
+    const what = o.t === 'knob' ? 'knob ' + o.d
+      : o.t === 'knobpress' && o.v === '0' ? 'press'
+      : o.t === 'input' && o.line === 'ir up' ? 'ir'
+      : o.t === 'input' && o.line === 'boot up' ? 'boot'
+      : o.t === 'reset' ? 'reset' : null;
+    if (what) try { h.postMessage(what); } catch (e) { /* the app went away: nothing to tell */ }
+  }
   // The firmware says where it is in one console line, "IP Address: a.b.c.d\r\n" (network.cpp: a print,
   // then a println of WiFi.localIP()). The serial chunks end anywhere, mid-line and mid-address: a chunk
   // ending in "IP Address: 192.168" once gave the page the address "192.168", which the browser takes
